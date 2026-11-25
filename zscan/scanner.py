@@ -1,9 +1,12 @@
 """Ties the analysers together for one file or a directory tree."""
 from __future__ import annotations
 
+import multiprocessing
 import os
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 from . import analysis
 from .analysis import FileReport, Finding
@@ -16,7 +19,7 @@ BINARY_TYPES = {"pe", "elf", "macho", "macho-fat"}
 # File types worth spending a slow VirusTotal lookup on even when they look clean.
 VT_TYPES = BINARY_TYPES | {"script", "ole", "pdf"} | ARCHIVE_TYPES | set(UNSUPPORTED_ARCHIVES)
 ARCHIVE_SEP = "!"   # shown as outer.zip!inner/file.exe
-COMPRESSED_TYPES = {"zip", "gzip", "bzip2", "xz"}   # bytes are noise to a text search
+CONTAINER_TYPES = {"zip", "gzip", "bzip2", "xz", "tar"}   # members get their own scan once unpacked
 
 
 class Scanner:
@@ -63,10 +66,11 @@ class Scanner:
         found, notes = self.yara.scan(data)
         f += found
         rep.unscanned += notes
-        # Compressed containers are noise to a text search; their members get
-        # their own string scan once unpacked.
-        compressed = self.unpack and rep.file_type in COMPRESSED_TYPES
-        strings = [] if compressed else analysis.string_findings(data)
+        # Text patterns only make sense on text-like bytes. Short ones match random data by
+        # chance, so skip compressed or encrypted content, and containers whose members
+        # are scanned on their own once unpacked.
+        skip_strings = (rep.size > 4096 and rep.entropy > 7.2) or (self.unpack and rep.file_type in CONTAINER_TYPES)
+        strings = [] if skip_strings else analysis.string_findings(data)
         if rep.file_type in BINARY_TYPES:
             # Compiled programs embed lots of harmless text (help strings, docs,
             # e.g. Go tools mention Invoke-Expression), so string hits count less.
@@ -178,3 +182,74 @@ class Scanner:
         """Yield top-level reports. Archive members hang off .children."""
         for p in self.iter_paths(target):
             yield self.scan_file(p)
+
+    def scan_many(self, paths: Iterable[Path], jobs: int = 1) -> Iterator[FileReport]:
+        """Scan files in order. With jobs > 1 the analysis runs in worker processes.
+
+        Hash lookups and archive roll-ups stay in this process, so online
+        lookups keep their rate limit and the results are the same as jobs=1.
+        """
+        if jobs <= 1:
+            for p in paths:
+                yield self.scan_file(p)
+            return
+        config = {"rule_paths": getattr(self.yara, "rule_paths", None),
+                  "community": getattr(self.yara, "use_community", True),
+                  "max_bytes": self.max_bytes, "unpack": self.unpack, "limits": self.limits}
+        # "spawn" behaves the same on every OS and avoids forking a process that already holds YARA state.
+        pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn"),
+                                   initializer=_worker_init, initargs=(config,))
+        in_flight: dict = {}     # future -> position in the input
+        ready: dict = {}         # position -> finished report waiting for its turn
+        submitted = next_out = 0
+        source = iter(paths)
+        exhausted = False
+        try:
+            while True:
+                # Keep every worker busy. Only unfinished work is capped, so one slow
+                # file at the front cannot stall the rest; finished reports are small.
+                while not exhausted and len(in_flight) < jobs * 4:
+                    try:
+                        path = next(source)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    in_flight[pool.submit(_worker_scan, str(path))] = submitted
+                    submitted += 1
+                if not in_flight:
+                    break
+                done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        ready[in_flight.pop(future)] = future.result()
+                    except BrokenProcessPool as e:
+                        raise WorkerCrashed("a scan worker process died unexpectedly "
+                                            "(a file crashed it); rerun with --jobs 1 to find which") from e
+                while next_out in ready:       # hand results out in input order
+                    yield self.finalize(ready.pop(next_out))
+                    next_out += 1
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)   # also runs if the caller stops early (Ctrl-C)
+
+
+class WorkerCrashed(RuntimeError):
+    """A worker process died, for example from a crash inside a native library."""
+
+
+_WORKER: Scanner | None = None
+
+
+def _worker_init(config: dict) -> None:
+    global _WORKER
+    _WORKER = Scanner(YaraEngine(config["rule_paths"], community=config["community"]),
+                      max_bytes=config["max_bytes"], unpack=config["unpack"], limits=config["limits"])
+
+
+def _worker_scan(path: str) -> FileReport:
+    try:
+        return _WORKER.analyze_file(Path(path))
+    except Exception as e:  # noqa: BLE001 - one bad file must not stop the whole scan
+        rep = FileReport(path=path)
+        rep.error = f"internal error: {type(e).__name__}: {e}"
+        return rep
+

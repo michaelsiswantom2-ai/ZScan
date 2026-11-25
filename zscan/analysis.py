@@ -122,14 +122,21 @@ def detect_type(data: bytes) -> str:
 # so write them in lower case. CASE_SENSITIVE ones run on the original bytes.
 SUSPICIOUS_PATTERNS = [
     (rb"powershell(?:\.exe)?\s+.{0,40}-e(?:nc|ncodedcommand)?\s", "PowerShell encoded command", 4),
-    (rb"iex\s*\(|invoke-expression", "PowerShell Invoke-Expression", 3),
-    (rb"downloadstring|downloadfile|net\.webclient", "Script download primitive", 3),
+    # Lone mentions are common in docs, editors' syntax files and installers, so these
+    # are weak; the classic download-and-run cradle is what carries the weight.
+    (rb"\biex\s*\(|\binvoke-expression\b", "PowerShell Invoke-Expression", 2),
+    (rb"net\.webclient\)?\s*\.\s*download(?:string|file|data)\s*\(", "PowerShell download cradle", 3),
+    (rb"\.download(?:string|file)\s*\(", "Script download call", 2),
     (rb"vssadmin(?:\.exe)?\s+delete\s+shadows", "Shadow copy deletion (ransomware trait)", 4),
     (rb"bcdedit(?:\.exe)?\s+/set\s+.{0,20}recoveryenabled\s+no", "Disables Windows recovery", 4),
     (rb"wevtutil(?:\.exe)?\s+cl\s", "Event log clearing", 3),
     (rb"software\\microsoft\\windows\\currentversion\\run", "Registry Run-key persistence", 3),
     (rb"schtasks(?:\.exe)?\s+/create", "Scheduled task creation", 2),
-    (rb"(?:curl|wget)\s[^\n|]{1,200}\|\s*(?:ba)?sh\b", "Pipe-to-shell download", 3),
+    # Install instructions ("curl https://... | bash") are everywhere in READMEs, so the plain
+    # form is weak; the same thing aimed at a bare IP address is how droppers look.
+    (rb"(?:curl|wget)\s[^\n|]{1,200}\|\s*(?:ba)?sh\b", "Pipe-to-shell download", 2),
+    (rb"(?:curl|wget)\s[^\n|]{0,100}https?://\d{1,3}(?:\.\d{1,3}){3}[^\n|]{0,100}\|\s*(?:ba)?sh\b",
+     "Pipe-to-shell download from a raw IP address", 3),
     (rb"/dev/tcp/\d{1,3}(?:\.\d{1,3}){3}/\d+", "Bash reverse shell", 4),
     (rb"\bnc(?:at)?\s+-[ec]\s", "Netcat command execution", 3),
     (rb"mimikatz|sekurlsa::", "Credential dumping tool reference", 4),

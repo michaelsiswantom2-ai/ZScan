@@ -23,7 +23,7 @@ UNSUPPORTED_ARCHIVES = {"rar": "RAR", "7z": "7-Zip", "zstd": "Zstandard"}
 @dataclass
 class Limits:
     max_depth: int = 3            # archive inside archive inside archive
-    max_members: int = 2000       # per archive
+    max_members: int = 10000      # per archive (about 1 ms each)
     max_member_bytes: int = 64 * 1024 * 1024
     max_total_bytes: int = 256 * 1024 * 1024   # uncompressed, per top-level file
     max_ratio: int = 200          # uncompressed / compressed, for members over 1 MiB

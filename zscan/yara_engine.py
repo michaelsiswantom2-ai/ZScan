@@ -54,6 +54,8 @@ def forge_severity(score) -> int:
 
 class YaraEngine:
     def __init__(self, rule_paths: list[Path] | None = None, community: bool = True):
+        self.rule_paths = [Path(p) for p in rule_paths] if rule_paths else None   # so worker processes
+        self.use_community = community                                           # can build the same engine
         self.local = None
         self.community = None
         self.community_info: dict = {}

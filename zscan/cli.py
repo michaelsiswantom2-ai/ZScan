@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__, intel
 from .config import cache_dir
-from .scanner import Scanner
+from .scanner import Scanner, WorkerCrashed
 from .yara_engine import FORGE_PACKS, YaraEngine, update_community
 
 SEV_LABEL = {1: "INFO", 2: "LOW", 3: "MED", 4: "HIGH", 5: "CRIT"}
@@ -90,6 +91,8 @@ def main(argv=None) -> int:
                     help="look up SHA-256 hashes online: CIRCL hashlookup, plus MalwareBazaar "
                          "and VirusTotal when MALWAREBAZAAR_API_KEY / VT_API_KEY are set. "
                          "Only hashes are sent, never file contents.")
+    ap.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                    help="scan with N worker processes (0 = one per CPU core; default 1)")
     ap.add_argument("--json", action="store_true", help="emit JSON report")
     ap.add_argument("-v", "--verbose", action="store_true", help="show details for clean files too")
     ap.add_argument("-q", "--quiet", action="store_true", help="only print non-clean files")
@@ -127,12 +130,23 @@ def main(argv=None) -> int:
     reports = []
     partial = 0
     counts = {"clean": 0, "suspicious": 0, "malicious": 0, "skipped": 0, "error": 0}
+    paths = []
     for target in a.paths:
         if not target.exists():
             print(f"error: {target} does not exist", file=sys.stderr)
             counts["error"] += 1
-            continue
-        for rep in scanner.scan(target):
+        else:
+            paths.append(target)
+    jobs = (os.cpu_count() or 1) if a.jobs == 0 else max(1, a.jobs)
+    if len(paths) == 1 and paths[0].is_file():
+        jobs = 1    # starting workers for a single file only slows it down
+
+    def all_files():
+        for target in paths:
+            yield from scanner.iter_paths(target)
+
+    try:
+        for rep in scanner.scan_many(all_files(), jobs):
             counts[rep.verdict] += 1
             partial += rep.partly_scanned
             if a.json:
@@ -144,6 +158,12 @@ def main(argv=None) -> int:
                 if a.quiet and node.verdict in ("clean", "skipped") and not node.unscanned:
                     continue
                 print(render_text(node, a.verbose, color))
+    except WorkerCrashed as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
 
     if online:
         online.save_cache()
