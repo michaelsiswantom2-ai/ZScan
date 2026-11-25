@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__, intel
 from .config import cache_dir
-from .scanner import Scanner
+from .scanner import Scanner, WorkerCrashed
 from .yara_engine import FORGE_PACKS, YaraEngine, update_community
 
 SEV_LABEL = {1: "INFO", 2: "LOW", 3: "MED", 4: "HIGH", 5: "CRIT"}
@@ -35,6 +36,11 @@ def render_text(rep, verbose: bool, color: bool) -> str:
                 continue
             detail = f"  ({f.detail})" if f.detail else ""
             lines.append(f"    [{SEV_LABEL[f.severity]:4}] {f.title}{detail}")
+    if rep.unscanned:
+        # Say so even for "clean" files: a gap in coverage should never be silent.
+        shown = rep.unscanned[:3]
+        more = len(rep.unscanned) - len(shown)
+        lines.append("    ~ not fully scanned: " + "; ".join(shown) + (f" (+{more} more)" if more else ""))
     return "\n".join(lines)
 
 
@@ -85,6 +91,8 @@ def main(argv=None) -> int:
                     help="look up SHA-256 hashes online: CIRCL hashlookup, plus MalwareBazaar "
                          "and VirusTotal when MALWAREBAZAAR_API_KEY / VT_API_KEY are set. "
                          "Only hashes are sent, never file contents.")
+    ap.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                    help="scan with N worker processes (0 = one per CPU core; default 1)")
     ap.add_argument("--json", action="store_true", help="emit JSON report")
     ap.add_argument("-v", "--verbose", action="store_true", help="show details for clean files too")
     ap.add_argument("-q", "--quiet", action="store_true", help="only print non-clean files")
@@ -120,23 +128,42 @@ def main(argv=None) -> int:
     color = sys.stdout.isatty() and not a.no_color
 
     reports = []
+    partial = 0
     counts = {"clean": 0, "suspicious": 0, "malicious": 0, "skipped": 0, "error": 0}
+    paths = []
     for target in a.paths:
         if not target.exists():
             print(f"error: {target} does not exist", file=sys.stderr)
             counts["error"] += 1
-            continue
-        for rep in scanner.scan(target):
+        else:
+            paths.append(target)
+    jobs = (os.cpu_count() or 1) if a.jobs == 0 else max(1, a.jobs)
+    if len(paths) == 1 and paths[0].is_file():
+        jobs = 1    # starting workers for a single file only slows it down
+
+    def all_files():
+        for target in paths:
+            yield from scanner.iter_paths(target)
+
+    try:
+        for rep in scanner.scan_many(all_files(), jobs):
             counts[rep.verdict] += 1
+            partial += rep.partly_scanned
             if a.json:
                 reports.append(rep)
                 continue
             for node in rep.iter_tree():
-                if node is not rep and node.verdict == "clean" and not a.verbose:
+                if node is not rep and node.verdict == "clean" and not a.verbose and not node.unscanned:
                     continue  # clean archive members stay quiet
-                if a.quiet and node.verdict in ("clean", "skipped"):
+                if a.quiet and node.verdict in ("clean", "skipped") and not node.unscanned:
                     continue
                 print(render_text(node, a.verbose, color))
+    except WorkerCrashed as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
 
     if online:
         online.save_cache()
@@ -144,11 +171,12 @@ def main(argv=None) -> int:
             print(f"warning: {w}", file=sys.stderr)
 
     if a.json:
-        json.dump({"summary": counts, "files": [to_dict(r) for r in reports]}, sys.stdout, indent=2)
+        json.dump({"summary": dict(counts, partly_scanned=partial), "files": [to_dict(r) for r in reports]}, sys.stdout, indent=2)
         print()
     else:
         total = sum(counts.values())
-        print(f"\nScanned {total} file(s): " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+        print(f"\nScanned {total} file(s): " + ", ".join(f"{v} {k}" for k, v in counts.items())
+              + (f"; {partial} not fully scanned" if partial else ""))
 
     # Exit codes: 0 clean, 1 suspicious, 2 malicious found, 3 errors only
     if counts["malicious"]:

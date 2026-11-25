@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zscan"
-version = "0.2.0"
+version = "0.3.0"
 description = "Prototype static malware scanner: YARA rules plus file heuristics"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = ["yara-python>=4.3", "pefile>=2023.2.7"]
 
 [project.optional-dependencies]

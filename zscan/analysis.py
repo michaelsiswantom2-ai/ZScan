@@ -35,12 +35,18 @@ class FileReport:
     error: str | None = None
     skipped: str | None = None
     children: list = field(default_factory=list)   # reports for archive members
+    unscanned: list = field(default_factory=list)  # what could not be checked, in plain words
 
     def iter_tree(self):
         """This report, then every nested archive member, depth first."""
         yield self
         for c in self.children:
             yield from c.iter_tree()
+
+    @property
+    def partly_scanned(self) -> bool:
+        """True if this file or anything inside it could not be fully checked."""
+        return any(n.unscanned for n in self.iter_tree())
 
     @property
     def score(self) -> int:
@@ -86,14 +92,21 @@ MAGIC = [
     (b"#!", "script"),
     (b"\xca\xfe\xba\xbe", "macho-fat"),
     (b"\xcf\xfa\xed\xfe", "macho"),
-    (b"\x1f\x8b", "gzip"),
+    (b"\x1f\x8b\x08", "gzip"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"Rar!\x1a\x07", "rar"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
 ]
+_BZIP2_LEVELS = {bytes([c]) for c in b"123456789"}
 
 
 def detect_type(data: bytes) -> str:
     for magic, name in MAGIC:
         if data.startswith(magic):
             return name
+    if data[:3] == b"BZh" and data[3:4] in _BZIP2_LEVELS and data[4:10] in (b"1AY&SY", b"\x17rE8P\x90"):
+        return "bzip2"
     if data[257:262] == b"ustar":
         return "tar"
     sample = data[:4096]
@@ -109,17 +122,25 @@ def detect_type(data: bytes) -> str:
 # so write them in lower case. CASE_SENSITIVE ones run on the original bytes.
 SUSPICIOUS_PATTERNS = [
     (rb"powershell(?:\.exe)?\s+.{0,40}-e(?:nc|ncodedcommand)?\s", "PowerShell encoded command", 4),
-    (rb"iex\s*\(|invoke-expression", "PowerShell Invoke-Expression", 3),
-    (rb"downloadstring|downloadfile|net\.webclient", "Script download primitive", 3),
+    # Lone mentions are common in docs, editors' syntax files and installers, so these
+    # are weak; the classic download-and-run cradle is what carries the weight.
+    (rb"\biex\s*\(|\binvoke-expression\b", "PowerShell Invoke-Expression", 2),
+    (rb"net\.webclient\)?\s*\.\s*download(?:string|file|data)\s*\(", "PowerShell download cradle", 3),
+    (rb"\.download(?:string|file)\s*\(", "Script download call", 2),
     (rb"vssadmin(?:\.exe)?\s+delete\s+shadows", "Shadow copy deletion (ransomware trait)", 4),
     (rb"bcdedit(?:\.exe)?\s+/set\s+.{0,20}recoveryenabled\s+no", "Disables Windows recovery", 4),
     (rb"wevtutil(?:\.exe)?\s+cl\s", "Event log clearing", 3),
     (rb"software\\microsoft\\windows\\currentversion\\run", "Registry Run-key persistence", 3),
     (rb"schtasks(?:\.exe)?\s+/create", "Scheduled task creation", 2),
-    (rb"(?:curl|wget)\s[^\n|]{1,200}\|\s*(?:ba)?sh\b", "Pipe-to-shell download", 3),
+    # Install instructions ("curl https://... | bash") are everywhere in READMEs, so the plain
+    # form is weak; the same thing aimed at a bare IP address is how droppers look.
+    (rb"(?:curl|wget)\s[^\n|]{1,200}\|\s*(?:ba)?sh\b", "Pipe-to-shell download", 2),
+    (rb"(?:curl|wget)\s[^\n|]{0,100}https?://\d{1,3}(?:\.\d{1,3}){3}[^\n|]{0,100}\|\s*(?:ba)?sh\b",
+     "Pipe-to-shell download from a raw IP address", 3),
     (rb"/dev/tcp/\d{1,3}(?:\.\d{1,3}){3}/\d+", "Bash reverse shell", 4),
     (rb"\bnc(?:at)?\s+-[ec]\s", "Netcat command execution", 3),
     (rb"mimikatz|sekurlsa::", "Credential dumping tool reference", 4),
+    (rb"stratum\+(?:tcp|ssl)://", "Crypto-miner pool URL", 3),
     (rb"your files (?:have been|are) encrypted", "Ransom note wording", 4),
     (rb"https?://\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?/", "URL with raw IP address", 2),
     (rb"\b[a-z2-7]{16,56}\.onion\b", "Tor .onion address", 3),
@@ -167,6 +188,13 @@ PACKER_SECTIONS = {"UPX0", "UPX1", "UPX2", ".aspack", ".adata", ".petite", ".nsp
 def pe_findings(data: bytes) -> list[Finding]:
     if pefile is None:
         return [Finding("pe", "pefile not installed; PE checks skipped", 1)]
+    try:
+        return _pe_findings(data)
+    except Exception as e:  # noqa: BLE001 - hostile files can trip odd errors inside pefile
+        return [Finding("pe", "PE analysis failed", 2, f"{type(e).__name__}: {e}")]
+
+
+def _pe_findings(data: bytes) -> list[Finding]:
     try:
         pe = pefile.PE(data=data, fast_load=False)
     except pefile.PEFormatError as e:

