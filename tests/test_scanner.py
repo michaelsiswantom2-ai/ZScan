@@ -5,13 +5,14 @@ import pytest
 from zscan import analysis
 from zscan.cli import main
 from zscan.scanner import Scanner
+from zscan.yara_engine import YaraEngine
 
 from samples import EICAR, benign_pe, packed_like_pe
 
 
 @pytest.fixture(scope="module")
 def scanner():
-    return Scanner()
+    return Scanner(YaraEngine(community=False))
 
 
 def write(tmp_path, name, data):
