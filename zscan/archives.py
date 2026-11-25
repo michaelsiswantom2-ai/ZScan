@@ -5,15 +5,19 @@ zip bombs and huge archives.
 """
 from __future__ import annotations
 
+import bz2
 import gzip
 import io
+import lzma
 import tarfile
 import warnings
 import zipfile
 from dataclasses import dataclass
 from typing import Iterator
 
-ARCHIVE_TYPES = {"zip", "tar", "gzip"}
+ARCHIVE_TYPES = {"zip", "tar", "gzip", "bzip2", "xz"}
+# Recognised, but zscan cannot open them; reported as "not fully scanned".
+UNSUPPORTED_ARCHIVES = {"rar": "RAR", "7z": "7-Zip", "zstd": "Zstandard"}
 
 
 @dataclass
@@ -49,9 +53,13 @@ class Budget:
 
 
 def iter_members(data: bytes, file_type: str, budget: Budget) -> Iterator[Member]:
-    readers = {"zip": _zip_members, "tar": _tar_members, "gzip": _gzip_member}
     try:
-        yield from readers[file_type](data, budget)
+        if file_type == "zip":
+            yield from _zip_members(data, budget)
+        elif file_type == "tar":
+            yield from _tar_members(data, budget)
+        else:   # gzip, bzip2, xz: one compressed stream holding one file
+            yield from _stream_member(data, file_type, budget)
     except Exception as e:  # noqa: BLE001 - corrupt or hostile archive: keep what was read so far
         yield Member("", note=f"unreadable {file_type}: {type(e).__name__}: {e}")
 
@@ -140,14 +148,26 @@ def _tar_members(data: bytes, budget: Budget) -> Iterator[Member]:
             yield Member(info.name, fh.read() if fh else b"")
 
 
-def _gzip_member(data: bytes, budget: Budget) -> Iterator[Member]:
+def _open_stream(data: bytes, file_type: str):
+    buf = io.BytesIO(data)
+    if file_type == "gzip":
+        return gzip.GzipFile(fileobj=buf)
+    if file_type == "bzip2":
+        return bz2.BZ2File(buf)
+    return lzma.LZMAFile(buf)
+
+
+def _stream_member(data: bytes, file_type: str, budget: Budget) -> Iterator[Member]:
     lim = budget.limits
     cap = min(lim.max_member_bytes, lim.max_total_bytes - budget.used)
+    if cap <= 0:
+        yield Member("(decompressed)", note="archive size budget used up, skipped")
+        return
     try:
-        with gzip.GzipFile(fileobj=io.BytesIO(data)) as g:
-            body = g.read(cap + 1)
-    except Exception as e:  # noqa: BLE001
-        yield Member("", note=f"unreadable gzip: {type(e).__name__}: {e}")
+        with _open_stream(data, file_type) as stream:
+            body = stream.read(cap + 1)    # never more than the cap, however big the stream claims to be
+    except Exception as e:  # noqa: BLE001 - OSError, EOFError, lzma.LZMAError, ...
+        yield Member("", note=f"unreadable {file_type}: {type(e).__name__}: {e}")
         return
     if len(body) > cap:
         ratio = len(body) // max(len(data), 1)

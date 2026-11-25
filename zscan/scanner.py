@@ -7,18 +7,27 @@ from typing import Iterator
 
 from . import analysis
 from .analysis import FileReport, Finding
+from .archives import ARCHIVE_TYPES, UNSUPPORTED_ARCHIVES, Budget, Limits, iter_members
 from .elf import elf_findings
-from .archives import ARCHIVE_TYPES, Budget, Limits, iter_members
 from .yara_engine import YaraEngine
 
 MAX_BYTES_DEFAULT = 64 * 1024 * 1024
 BINARY_TYPES = {"pe", "elf", "macho", "macho-fat"}
 # File types worth spending a slow VirusTotal lookup on even when they look clean.
-VT_TYPES = BINARY_TYPES | {"script", "ole", "pdf", "zip"}
+VT_TYPES = BINARY_TYPES | {"script", "ole", "pdf"} | ARCHIVE_TYPES | set(UNSUPPORTED_ARCHIVES)
 ARCHIVE_SEP = "!"   # shown as outer.zip!inner/file.exe
+COMPRESSED_TYPES = {"zip", "gzip", "bzip2", "xz"}   # bytes are noise to a text search
 
 
 class Scanner:
+    """Two phases, so the slow part can run in worker processes:
+
+    analyze_*  looks at the bytes only (hashes, YARA, heuristics, unpacking).
+    finalize   runs in the main process: hash lookups, then each archive takes
+               the verdict of its worst member.
+    scan_file  does both.
+    """
+
     def __init__(self, yara_engine: YaraEngine | None = None, max_bytes: int = MAX_BYTES_DEFAULT,
                  unpack: bool = True, limits: Limits | None = None,
                  hash_list=None, online=None):
@@ -29,9 +38,9 @@ class Scanner:
         self.hash_list = hash_list   # intel.HashList or None
         self.online = online         # intel.OnlineIntel or None
 
-    # ------------------------------------------------------------ files
+    # ------------------------------------------------------------ phase 1: analyse
 
-    def scan_file(self, path: Path) -> FileReport:
+    def analyze_file(self, path: Path) -> FileReport:
         rep = FileReport(path=str(path))
         try:
             rep.size = path.stat().st_size
@@ -42,9 +51,9 @@ class Scanner:
         except OSError as e:
             rep.error = f"cannot read: {e.strerror or e}"
             return rep
-        return self.scan_bytes(data, str(path), Budget(self.limits), depth=0)
+        return self.analyze_bytes(data, str(path), Budget(self.limits), depth=0)
 
-    def scan_bytes(self, data: bytes, display: str, budget: Budget, depth: int) -> FileReport:
+    def analyze_bytes(self, data: bytes, display: str, budget: Budget, depth: int) -> FileReport:
         rep = FileReport(path=display, size=len(data))
         rep.hashes = analysis.hashes(data)
         rep.entropy = round(analysis.shannon_entropy(data), 3)
@@ -56,7 +65,7 @@ class Scanner:
         rep.unscanned += notes
         # Compressed containers are noise to a text search; their members get
         # their own string scan once unpacked.
-        compressed = self.unpack and rep.file_type in ("zip", "gzip")
+        compressed = self.unpack and rep.file_type in COMPRESSED_TYPES
         strings = [] if compressed else analysis.string_findings(data)
         if rep.file_type in BINARY_TYPES:
             # Compiled programs embed lots of harmless text (help strings, docs,
@@ -74,49 +83,53 @@ class Scanner:
             f.append(Finding("entropy", "Very high file entropy", 2,
                              f"{rep.entropy} bits/byte (encrypted or packed content?)"))
 
-        if self.unpack and rep.file_type in ARCHIVE_TYPES:
-            self._scan_archive(rep, data, budget, depth)
-
-        self._intel(rep)
-        f.sort(key=lambda x: -x.severity)
+        if self.unpack:
+            if rep.file_type in ARCHIVE_TYPES:
+                self._unpack(rep, data, budget, depth)
+            elif rep.file_type in UNSUPPORTED_ARCHIVES:
+                rep.unscanned.append(f"{UNSUPPORTED_ARCHIVES[rep.file_type]} archive: "
+                                     "contents not scanned (format not supported)")
         return rep
 
-    def _scan_archive(self, rep: FileReport, data: bytes, budget: Budget, depth: int) -> None:
+    def _unpack(self, rep: FileReport, data: bytes, budget: Budget, depth: int) -> None:
         if depth >= self.limits.max_depth:
             rep.findings.append(Finding("archive", "Archive nested too deep, not unpacked", 2,
                                         f"more than {self.limits.max_depth} levels"))
+            rep.unscanned.append(f"contents not scanned: nested more than {self.limits.max_depth} levels deep")
             return
-        encrypted = []
+        encrypted, skipped = [], []
         for m in iter_members(data, rep.file_type, budget):
+            label = f"{m.name}: {m.note}" if m.name else (m.note or "")
             if m.encrypted:
                 encrypted.append(m.name)
-                continue
-            if m.bomb:
-                rep.findings.append(Finding("archive", "Possible zip bomb", 4, f"{m.name}: {m.note}"))
-                continue
-            if m.data is None:
-                rep.findings.append(Finding("archive", "Archive member not scanned", 1,
-                                            f"{m.name}: {m.note}" if m.name else m.note))
-                continue
-            child = self.scan_bytes(m.data, f"{rep.path}{ARCHIVE_SEP}{m.name}", budget, depth + 1)
-            rep.children.append(child)
+            elif m.bomb:
+                rep.findings.append(Finding("archive", "Possible zip bomb", 4, label))
+                skipped.append(label)
+            elif m.data is None:
+                skipped.append(label)
+            else:
+                rep.children.append(
+                    self.analyze_bytes(m.data, f"{rep.path}{ARCHIVE_SEP}{m.name}", budget, depth + 1))
         if encrypted:
             # Password-protected archives are a classic way to slip malware past
             # mail gateways, since nobody can look inside without the password.
             rep.findings.append(Finding("archive", "Password-protected archive members", 3,
                                         f"{len(encrypted)} encrypted, e.g. {encrypted[0]}"))
-        # Let the worst member drive the archive's own verdict.
-        worst = None
-        for c in rep.iter_tree():
-            if c is rep or c.verdict in ("clean", "skipped", "error"):
-                continue
-            top = max((x.severity for x in c.findings), default=0)
-            if worst is None or (top, c.score) > worst[0]:
-                worst = ((top, c.score), c)
-        if worst:
-            (top, _), c = worst
-            inner = c.path[len(rep.path) + 1:]
-            rep.findings.append(Finding("archive", f"Contains {c.verdict} file", max(top, 3), inner))
+            rep.unscanned.append(f"{len(encrypted)} password-protected member(s) could not be opened")
+        rep.unscanned += skipped[:10]
+        if len(skipped) > 10:
+            rep.unscanned.append(f"... and {len(skipped) - 10} more archive members not scanned")
+
+    # ------------------------------------------------------------ phase 2: finalize
+
+    def finalize(self, rep: FileReport) -> FileReport:
+        for child in rep.children:
+            self.finalize(child)
+        self._intel(rep)
+        if rep.children:
+            self._roll_up(rep)
+        rep.findings.sort(key=lambda x: -x.severity)
+        return rep
 
     def _intel(self, rep: FileReport) -> None:
         sha = rep.hashes.get("sha256")
@@ -127,6 +140,24 @@ class Scanner:
         if self.online is not None:
             worth_vt = rep.file_type in VT_TYPES or rep.verdict != "clean"
             rep.findings += self.online.lookup(sha, worth_vt)
+
+    def _roll_up(self, rep: FileReport) -> None:
+        """An archive is as bad as the worst thing inside it; point at that file."""
+        worst = None
+        for c in rep.iter_tree():
+            if c is rep or c.verdict in ("clean", "skipped", "error"):
+                continue
+            # malicious beats suspicious, then higher score; the deepest file wins ties
+            key = (c.verdict == "malicious", c.score, c.path.count(ARCHIVE_SEP))
+            if worst is None or key > worst[0]:
+                worst = (key, c)
+        if worst:
+            c = worst[1]
+            rep.findings.append(Finding("archive", f"Contains {c.verdict} file",
+                                        5 if c.verdict == "malicious" else 3, c.path[len(rep.path) + 1:]))
+
+    def scan_file(self, path: Path) -> FileReport:
+        return self.finalize(self.analyze_file(path))
 
     # ------------------------------------------------------------ trees
 

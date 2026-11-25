@@ -92,14 +92,21 @@ MAGIC = [
     (b"#!", "script"),
     (b"\xca\xfe\xba\xbe", "macho-fat"),
     (b"\xcf\xfa\xed\xfe", "macho"),
-    (b"\x1f\x8b", "gzip"),
+    (b"\x1f\x8b\x08", "gzip"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"Rar!\x1a\x07", "rar"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
 ]
+_BZIP2_LEVELS = {bytes([c]) for c in b"123456789"}
 
 
 def detect_type(data: bytes) -> str:
     for magic, name in MAGIC:
         if data.startswith(magic):
             return name
+    if data[:3] == b"BZh" and data[3:4] in _BZIP2_LEVELS and data[4:10] in (b"1AY&SY", b"\x17rE8P\x90"):
+        return "bzip2"
     if data[257:262] == b"ustar":
         return "tar"
     sample = data[:4096]

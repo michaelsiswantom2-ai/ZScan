@@ -6,6 +6,7 @@ trip other antivirus products.
 import io
 import os
 import struct
+import tarfile
 import zipfile
 
 # EICAR assembled from two halves so this source file is not itself flagged.
@@ -148,3 +149,13 @@ def build_elf(*, bits=64, big=False, load_flags=5, entry=None, text=None, import
             fmt = e + ("Q" if bits == 64 else "I")
             struct.pack_into(fmt, out, e_shoff, len(out) + shoff_delta)
     return bytes(out)
+
+
+def make_tar(files):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
