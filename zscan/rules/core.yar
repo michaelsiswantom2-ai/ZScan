@@ -17,14 +17,17 @@ rule EICAR_Test_File
 rule UPX_Packed
 {
     meta:
-        description = "Executable packed with UPX"
+        description = "Executable packed with UPX (Windows or Linux)"
         severity = 2
     strings:
         $upx0 = "UPX0"
         $upx1 = "UPX1"
         $sig  = "UPX!"
+        $info = "This file is packed with the UPX executable packer"
+        $id   = "$Id: UPX"
     condition:
-        uint16(0) == 0x5A4D and 2 of them
+        (uint16(0) == 0x5A4D and 2 of ($upx0, $upx1, $sig))
+        or (uint32(0) == 0x464C457F and $sig and 1 of ($info, $id))
 }
 
 rule Ransomware_Commands

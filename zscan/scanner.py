@@ -7,6 +7,7 @@ from typing import Iterator
 
 from . import analysis
 from .analysis import FileReport, Finding
+from .elf import elf_findings
 from .archives import ARCHIVE_TYPES, Budget, Limits, iter_members
 from .yara_engine import YaraEngine
 
@@ -65,6 +66,8 @@ class Scanner:
         f += strings
         if rep.file_type == "pe":
             f += analysis.pe_findings(data)
+        elif rep.file_type == "elf":
+            f += elf_findings(data)
         # Whole-file entropy matters mostly for executables; compressed formats
         # (zip, gzip, pdf streams) are naturally near 8.0.
         if rep.entropy > 7.5 and rep.size > 4096 and rep.file_type in ("pe", "elf", "data", "script"):

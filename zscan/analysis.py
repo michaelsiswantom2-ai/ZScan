@@ -126,6 +126,7 @@ SUSPICIOUS_PATTERNS = [
     (rb"/dev/tcp/\d{1,3}(?:\.\d{1,3}){3}/\d+", "Bash reverse shell", 4),
     (rb"\bnc(?:at)?\s+-[ec]\s", "Netcat command execution", 3),
     (rb"mimikatz|sekurlsa::", "Credential dumping tool reference", 4),
+    (rb"stratum\+(?:tcp|ssl)://", "Crypto-miner pool URL", 3),
     (rb"your files (?:have been|are) encrypted", "Ransom note wording", 4),
     (rb"https?://\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?/", "URL with raw IP address", 2),
     (rb"\b[a-z2-7]{16,56}\.onion\b", "Tor .onion address", 3),
