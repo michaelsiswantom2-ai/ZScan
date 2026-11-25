@@ -7,9 +7,10 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from . import __version__
+from . import __version__, intel
+from .config import cache_dir
 from .scanner import Scanner
-from .yara_engine import YaraEngine
+from .yara_engine import FORGE_PACKS, YaraEngine, update_community
 
 SEV_LABEL = {1: "INFO", 2: "LOW", 3: "MED", 4: "HIGH", 5: "CRIT"}
 COLORS = {"clean": "\033[32m", "suspicious": "\033[33m", "malicious": "\033[31m", "error": "\033[35m", "skipped": "\033[90m"}
@@ -37,12 +38,53 @@ def render_text(rep, verbose: bool, color: bool) -> str:
     return "\n".join(lines)
 
 
+def to_dict(rep) -> dict:
+    d = asdict(rep)
+    d.pop("children")
+    d.update(score=rep.score, verdict=rep.verdict)
+    if rep.children:
+        d["members"] = [to_dict(c) for c in rep.children]
+    return d
+
+
+def run_update(pack: str) -> int:
+    ok = True
+    try:
+        meta = update_community(pack)
+        print(f"YARA-Forge '{meta['pack']}' rules: {meta['rules']} rules, "
+              f"version {meta['version'] or '?'} ({meta['created'] or 'unknown date'})")
+    except Exception as e:  # noqa: BLE001 - report any failure and carry on
+        print(f"error: could not update YARA-Forge rules: {e}", file=sys.stderr)
+        ok = False
+    try:
+        path, n = intel.update_bazaar_list()
+        print(f"MalwareBazaar recent hashes: {n} saved to {path}")
+    except Exception as e:  # noqa: BLE001
+        print(f"warning: could not fetch MalwareBazaar hash list: {e}", file=sys.stderr)
+    print(f"Cache folder: {cache_dir()}")
+    return 0 if ok else 3
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="zscan", description="Prototype static malware scanner "
                                  "(YARA + heuristics). Never executes scanned files.")
-    ap.add_argument("paths", nargs="+", type=Path, help="files or directories to scan")
+    ap.add_argument("paths", nargs="*", type=Path, help="files or directories to scan")
     ap.add_argument("-r", "--rules", action="append", type=Path,
-                    help="YARA rule file or directory (repeatable; default: bundled rules)")
+                    help="YARA rule file or directory (repeatable; replaces the bundled rules)")
+    ap.add_argument("--no-community", action="store_true",
+                    help="don't load downloaded YARA-Forge rules")
+    ap.add_argument("--update", action="store_true",
+                    help="download community YARA rules (YARA-Forge) and the MalwareBazaar "
+                         "recent-hash list into the cache, then exit unless paths are given")
+    ap.add_argument("--rule-pack", choices=FORGE_PACKS, default="core",
+                    help="YARA-Forge package for --update (default core; full is noisier)")
+    ap.add_argument("--no-unpack", action="store_true", help="don't look inside zip/tar/gzip files")
+    ap.add_argument("--hashlist", action="append", type=Path, default=[],
+                    help="file of known-bad hashes, one per line (repeatable)")
+    ap.add_argument("--intel", action="store_true",
+                    help="look up SHA-256 hashes online: CIRCL hashlookup, plus MalwareBazaar "
+                         "and VirusTotal when MALWAREBAZAAR_API_KEY / VT_API_KEY are set. "
+                         "Only hashes are sent, never file contents.")
     ap.add_argument("--json", action="store_true", help="emit JSON report")
     ap.add_argument("-v", "--verbose", action="store_true", help="show details for clean files too")
     ap.add_argument("-q", "--quiet", action="store_true", help="only print non-clean files")
@@ -51,10 +93,30 @@ def main(argv=None) -> int:
     ap.add_argument("--version", action="version", version=f"zscan {__version__}")
     a = ap.parse_args(argv)
 
-    engine = YaraEngine(a.rules)
+    if a.update:
+        code = run_update(a.rule_pack)
+        if not a.paths:
+            return code
+    if not a.paths:
+        ap.error("give at least one file or directory to scan (or --update)")
+
+    engine = YaraEngine(a.rules, community=not a.no_community)
     if engine.error:
         print(f"warning: {engine.error}", file=sys.stderr)
-    scanner = Scanner(engine, max_bytes=a.max_size * 1024 * 1024)
+    if engine.community is None and not a.no_community and not a.json:
+        print("note: community YARA rules not installed; run `zscan --update` to add them",
+              file=sys.stderr)
+
+    hash_list = None
+    lists = a.hashlist + intel.default_hash_lists()
+    if lists:
+        hash_list = intel.HashList(lists)
+    online = intel.OnlineIntel() if a.intel else None
+    if online and not a.json:
+        print(f"intel: looking up hashes with {', '.join(online.sources)}", file=sys.stderr)
+
+    scanner = Scanner(engine, max_bytes=a.max_size * 1024 * 1024, unpack=not a.no_unpack,
+                      hash_list=hash_list, online=online)
     color = sys.stdout.isatty() and not a.no_color
 
     reports = []
@@ -68,12 +130,21 @@ def main(argv=None) -> int:
             counts[rep.verdict] += 1
             if a.json:
                 reports.append(rep)
-            elif not (a.quiet and rep.verdict in ("clean", "skipped")):
-                print(render_text(rep, a.verbose, color))
+                continue
+            for node in rep.iter_tree():
+                if node is not rep and node.verdict == "clean" and not a.verbose:
+                    continue  # clean archive members stay quiet
+                if a.quiet and node.verdict in ("clean", "skipped"):
+                    continue
+                print(render_text(node, a.verbose, color))
+
+    if online:
+        online.save_cache()
+        for w in online.warnings:
+            print(f"warning: {w}", file=sys.stderr)
 
     if a.json:
-        out = [dict(asdict(r), score=r.score, verdict=r.verdict) for r in reports]
-        json.dump({"summary": counts, "files": out}, sys.stdout, indent=2)
+        json.dump({"summary": counts, "files": [to_dict(r) for r in reports]}, sys.stdout, indent=2)
         print()
     else:
         total = sum(counts.values())

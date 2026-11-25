@@ -34,6 +34,13 @@ class FileReport:
     findings: list = field(default_factory=list)
     error: str | None = None
     skipped: str | None = None
+    children: list = field(default_factory=list)   # reports for archive members
+
+    def iter_tree(self):
+        """This report, then every nested archive member, depth first."""
+        yield self
+        for c in self.children:
+            yield from c.iter_tree()
 
     @property
     def score(self) -> int:
@@ -79,6 +86,7 @@ MAGIC = [
     (b"#!", "script"),
     (b"\xca\xfe\xba\xbe", "macho-fat"),
     (b"\xcf\xfa\xed\xfe", "macho"),
+    (b"\x1f\x8b", "gzip"),
 ]
 
 
@@ -86,6 +94,8 @@ def detect_type(data: bytes) -> str:
     for magic, name in MAGIC:
         if data.startswith(magic):
             return name
+    if data[257:262] == b"ustar":
+        return "tar"
     sample = data[:4096]
     if sample and all(32 <= b < 127 or b in (9, 10, 13) for b in sample):
         return "text"
