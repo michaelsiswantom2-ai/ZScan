@@ -35,12 +35,18 @@ class FileReport:
     error: str | None = None
     skipped: str | None = None
     children: list = field(default_factory=list)   # reports for archive members
+    unscanned: list = field(default_factory=list)  # what could not be checked, in plain words
 
     def iter_tree(self):
         """This report, then every nested archive member, depth first."""
         yield self
         for c in self.children:
             yield from c.iter_tree()
+
+    @property
+    def partly_scanned(self) -> bool:
+        """True if this file or anything inside it could not be fully checked."""
+        return any(n.unscanned for n in self.iter_tree())
 
     @property
     def score(self) -> int:
@@ -167,6 +173,13 @@ PACKER_SECTIONS = {"UPX0", "UPX1", "UPX2", ".aspack", ".adata", ".petite", ".nsp
 def pe_findings(data: bytes) -> list[Finding]:
     if pefile is None:
         return [Finding("pe", "pefile not installed; PE checks skipped", 1)]
+    try:
+        return _pe_findings(data)
+    except Exception as e:  # noqa: BLE001 - hostile files can trip odd errors inside pefile
+        return [Finding("pe", "PE analysis failed", 2, f"{type(e).__name__}: {e}")]
+
+
+def _pe_findings(data: bytes) -> list[Finding]:
     try:
         pe = pefile.PE(data=data, fast_load=False)
     except pefile.PEFormatError as e:

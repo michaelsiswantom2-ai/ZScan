@@ -3,8 +3,10 @@
 Samples are built at test time so the repo itself never contains files that
 trip other antivirus products.
 """
+import io
 import os
 import struct
+import zipfile
 
 # EICAR assembled from two halves so this source file is not itself flagged.
 EICAR = (b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$"
@@ -65,3 +67,11 @@ def packed_like_pe():
     return build_pe([(b"UPX0", b"", CODE_RWX),
                      (b"UPX1", b"UPX!" + payload, CODE_RWX)],
                     entry_rva=0x2000, timestamp=0)
+
+
+def make_zip(files, compression=zipfile.ZIP_DEFLATED):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    return buf.getvalue()

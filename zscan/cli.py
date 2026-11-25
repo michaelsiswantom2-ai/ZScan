@@ -35,6 +35,11 @@ def render_text(rep, verbose: bool, color: bool) -> str:
                 continue
             detail = f"  ({f.detail})" if f.detail else ""
             lines.append(f"    [{SEV_LABEL[f.severity]:4}] {f.title}{detail}")
+    if rep.unscanned:
+        # Say so even for "clean" files: a gap in coverage should never be silent.
+        shown = rep.unscanned[:3]
+        more = len(rep.unscanned) - len(shown)
+        lines.append("    ~ not fully scanned: " + "; ".join(shown) + (f" (+{more} more)" if more else ""))
     return "\n".join(lines)
 
 
@@ -120,6 +125,7 @@ def main(argv=None) -> int:
     color = sys.stdout.isatty() and not a.no_color
 
     reports = []
+    partial = 0
     counts = {"clean": 0, "suspicious": 0, "malicious": 0, "skipped": 0, "error": 0}
     for target in a.paths:
         if not target.exists():
@@ -128,13 +134,14 @@ def main(argv=None) -> int:
             continue
         for rep in scanner.scan(target):
             counts[rep.verdict] += 1
+            partial += rep.partly_scanned
             if a.json:
                 reports.append(rep)
                 continue
             for node in rep.iter_tree():
-                if node is not rep and node.verdict == "clean" and not a.verbose:
+                if node is not rep and node.verdict == "clean" and not a.verbose and not node.unscanned:
                     continue  # clean archive members stay quiet
-                if a.quiet and node.verdict in ("clean", "skipped"):
+                if a.quiet and node.verdict in ("clean", "skipped") and not node.unscanned:
                     continue
                 print(render_text(node, a.verbose, color))
 
@@ -144,11 +151,12 @@ def main(argv=None) -> int:
             print(f"warning: {w}", file=sys.stderr)
 
     if a.json:
-        json.dump({"summary": counts, "files": [to_dict(r) for r in reports]}, sys.stdout, indent=2)
+        json.dump({"summary": dict(counts, partly_scanned=partial), "files": [to_dict(r) for r in reports]}, sys.stdout, indent=2)
         print()
     else:
         total = sum(counts.values())
-        print(f"\nScanned {total} file(s): " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+        print(f"\nScanned {total} file(s): " + ", ".join(f"{v} {k}" for k, v in counts.items())
+              + (f"; {partial} not fully scanned" if partial else ""))
 
     # Exit codes: 0 clean, 1 suspicious, 2 malicious found, 3 errors only
     if counts["malicious"]:

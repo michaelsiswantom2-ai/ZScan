@@ -50,7 +50,9 @@ class Scanner:
         rep.file_type = analysis.detect_type(data)
 
         f = rep.findings
-        f += self.yara.scan(data)
+        found, notes = self.yara.scan(data)
+        f += found
+        rep.unscanned += notes
         # Compressed containers are noise to a text search; their members get
         # their own string scan once unpacked.
         compressed = self.unpack and rep.file_type in ("zip", "gzip")

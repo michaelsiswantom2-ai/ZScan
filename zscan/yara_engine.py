@@ -11,6 +11,7 @@ import io
 import json
 import re
 import time
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -85,25 +86,40 @@ class YaraEngine:
         except (yara.Error, OSError, ValueError) as e:
             self.error = f"community rules unreadable ({e}); run zscan --update"
 
-    def scan(self, data: bytes) -> list[Finding]:
-        out = []
+    def scan(self, data: bytes) -> tuple[list[Finding], list[str]]:
+        """Match all loaded rules. Returns (findings, notes); notes say what could not be checked."""
+        out: list[Finding] = []
+        notes: list[str] = []
         if self.local is not None:
-            for m in self.local.match(data=data, timeout=30):
+            matches, note = _run(self.local, data, 30, "bundled/custom")
+            notes += [note] if note else []
+            for m in matches:
                 sev = int(m.meta.get("severity", 3))
                 out.append(Finding("yara", f"YARA: {m.rule}", sev, m.meta.get("description", "")))
         if self.community is not None:
-            try:
-                matches = self.community.match(data=data, timeout=60)
-            except yara.TimeoutError:
-                matches = []
-                out.append(Finding("yara", "Community YARA scan timed out", 1))
+            matches, note = _run(self.community, data, 60, "community")
+            notes += [note] if note else []
             for m in matches:
                 sev = forge_severity(m.meta.get("score"))
                 detail = m.meta.get("description", "")
                 if m.meta.get("author"):
                     detail += f" (by {m.meta['author']})"
                 out.append(Finding("yara", f"YARA-Forge: {m.rule}", sev, detail.strip()))
-        return out
+        return out, notes
+
+
+def _run(rules, data: bytes, timeout: int, label: str):
+    """rules.match() that turns timeouts and engine errors into a note instead of a crash."""
+    try:
+        with warnings.catch_warnings():
+            # YARA warns (it does not fail) when one string matches over a million
+            # times, e.g. a short hex string in a big zero-filled file. Results stay valid.
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return rules.match(data=data, timeout=timeout), None
+    except yara.TimeoutError:
+        return [], f"{label} YARA rules timed out after {timeout}s"
+    except yara.Error as e:
+        return [], f"{label} YARA rules failed: {e}"
 
 
 def update_community(pack: str = "core", fetch=None) -> dict:

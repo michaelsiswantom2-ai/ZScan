@@ -9,20 +9,12 @@ from zscan.archives import Limits
 from zscan.scanner import Scanner
 from zscan.yara_engine import YaraEngine
 
-from samples import EICAR, benign_pe
+from samples import EICAR, benign_pe, make_zip
 
 
 @pytest.fixture(scope="module")
 def engine():
     return YaraEngine(community=False)
-
-
-def make_zip(files, compression=zipfile.ZIP_DEFLATED):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression) as z:
-        for name, data in files.items():
-            z.writestr(name, data)
-    return buf.getvalue()
 
 
 def scan(engine, tmp_path, name, data, **kw):
@@ -98,3 +90,16 @@ def test_no_unpack(engine, tmp_path):
 def test_corrupt_zip_does_not_crash(engine, tmp_path):
     rep = scan(engine, tmp_path, "bad.zip", b"PK\x03\x04" + b"garbage" * 10)
     assert rep.verdict in ("clean", "suspicious")
+
+
+def test_overlapping_zip_entries_are_a_bomb(engine, tmp_path):
+    data = bytearray(make_zip({"a.txt": b"A" * 5000, "b.txt": b"B" * 5000}, zipfile.ZIP_STORED))
+    # Point the second central-directory entry at the first entry's data.
+    entries = [i for i in range(len(data)) if data[i:i + 4] == b"PK\x01\x02"]
+    first_offset = data[entries[0] + 42:entries[0] + 46]
+    data[entries[1] + 42:entries[1] + 46] = first_offset
+    rep = scan(engine, tmp_path, "overlap.zip", bytes(data))
+    assert rep.children == []
+    bomb = [f for f in rep.findings if f.title == "Possible zip bomb"]
+    assert bomb and "overlapping entries" in bomb[0].detail
+    assert rep.verdict == "suspicious"
