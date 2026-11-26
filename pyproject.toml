@@ -16,5 +16,8 @@ ml = ["numpy>=1.26", "lightgbm>=4.0"]
 [project.scripts]
 zscan = "zscan.cli:main"
 
+[tool.setuptools.packages.find]
+include = ["zscan*"]
+
 [tool.setuptools.package-data]
 zscan = ["rules/*.yar"]
