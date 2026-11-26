@@ -36,6 +36,7 @@ class FileReport:
     skipped: str | None = None
     children: list = field(default_factory=list)   # reports for archive members
     unscanned: list = field(default_factory=list)  # what could not be checked, in plain words
+    ml: dict | None = None                         # ML check result: {"model": ..., "score": ...}
 
     def iter_tree(self):
         """This report, then every nested archive member, depth first."""

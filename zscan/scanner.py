@@ -12,6 +12,7 @@ from . import analysis
 from .analysis import FileReport, Finding
 from .archives import ARCHIVE_TYPES, UNSUPPORTED_ARCHIVES, Budget, Limits, iter_members
 from .elf import elf_findings
+from .ml.model import MODEL_LABELS, MlScorer
 from .yara_engine import YaraEngine
 
 MAX_BYTES_DEFAULT = 64 * 1024 * 1024
@@ -33,13 +34,14 @@ class Scanner:
 
     def __init__(self, yara_engine: YaraEngine | None = None, max_bytes: int = MAX_BYTES_DEFAULT,
                  unpack: bool = True, limits: Limits | None = None,
-                 hash_list=None, online=None):
+                 hash_list=None, online=None, ml: MlScorer | None = None):
         self.yara = yara_engine or YaraEngine()
         self.max_bytes = max_bytes
         self.unpack = unpack
         self.limits = limits or Limits(max_member_bytes=max_bytes)
         self.hash_list = hash_list   # intel.HashList or None
         self.online = online         # intel.OnlineIntel or None
+        self.ml = ml                 # ml.model.MlScorer or None (opt-in --ml)
 
     # ------------------------------------------------------------ phase 1: analyse
 
@@ -87,6 +89,9 @@ class Scanner:
             f.append(Finding("entropy", "Very high file entropy", 2,
                              f"{rep.entropy} bits/byte (encrypted or packed content?)"))
 
+        if self.ml is not None:
+            self._ml_check(rep, data)
+
         if self.unpack:
             if rep.file_type in ARCHIVE_TYPES:
                 self._unpack(rep, data, budget, depth)
@@ -94,6 +99,28 @@ class Scanner:
                 rep.unscanned.append(f"{UNSUPPORTED_ARCHIVES[rep.file_type]} archive: "
                                      "contents not scanned (format not supported)")
         return rep
+
+    def _ml_check(self, rep: FileReport, data: bytes) -> None:
+        """Score ELF, PDF and APK files with the EMBER2024 model for that type."""
+        kind = self.ml.kind_for(rep.file_type, data)
+        if kind is None:
+            return
+        label = MODEL_LABELS[kind]
+        if not self.ml.has_model(kind):
+            rep.unscanned.append(f"ML check not run: no {label} model installed (zscan --update-ml)")
+            return
+        try:
+            result = self.ml.score(kind, data)
+        except Exception as e:  # noqa: BLE001 - the ML step must never break a scan
+            rep.unscanned.append(f"ML check failed on this {label} file: {type(e).__name__}")
+            return
+        if result is None:
+            rep.unscanned.append(f"ML check not run: {label} file too small to judge")
+            return
+        rep.ml = {"model": result.model, "score": round(result.score, 4)}
+        sev = self.ml.severity(result.score)
+        title = "ML model: resembles known malware" if sev > 1 else f"ML model score {result.score:.3f}"
+        rep.findings.append(Finding("ml", title, sev, f"score {result.score:.3f}, EMBER2024 {label} model"))
 
     def _unpack(self, rep: FileReport, data: bytes, budget: Budget, depth: int) -> None:
         if depth >= self.limits.max_depth:
@@ -195,7 +222,9 @@ class Scanner:
             return
         config = {"rule_paths": getattr(self.yara, "rule_paths", None),
                   "community": getattr(self.yara, "use_community", True),
-                  "max_bytes": self.max_bytes, "unpack": self.unpack, "limits": self.limits}
+                  "max_bytes": self.max_bytes, "unpack": self.unpack, "limits": self.limits,
+                  "ml": ({"threshold": self.ml.threshold, "directory": str(self.ml.directory)}
+                         if self.ml is not None else None)}
         # "spawn" behaves the same on every OS and avoids forking a process that already holds YARA state.
         pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn"),
                                    initializer=_worker_init, initargs=(config,))
@@ -241,8 +270,11 @@ _WORKER: Scanner | None = None
 
 def _worker_init(config: dict) -> None:
     global _WORKER
+    ml = config.get("ml")
+    scorer = MlScorer(ml["threshold"], Path(ml["directory"])) if ml else None
     _WORKER = Scanner(YaraEngine(config["rule_paths"], community=config["community"]),
-                      max_bytes=config["max_bytes"], unpack=config["unpack"], limits=config["limits"])
+                      max_bytes=config["max_bytes"], unpack=config["unpack"], limits=config["limits"],
+                      ml=scorer)
 
 
 def _worker_scan(path: str) -> FileReport:

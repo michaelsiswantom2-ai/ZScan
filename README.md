@@ -18,6 +18,7 @@ opened in memory, never extracted to disk.
 | Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content) |
 | PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays |
 | ELF heuristics (Linux) | Writable+executable segments, entry point outside the executable segments, missing or out-of-file section table, high-entropy code sections, weak import hints (reverse-shell shape, `ptrace`). Uses a small built-in ELF reader (32/64-bit, both byte orders). |
+| ML check (opt-in, `--ml`) | ELF, PDF and APK files are scored by machine-learning models trained on the public EMBER2024 data: how much does this file look like malware rather than like benign programs? Meant for files no rule knows yet. A statistical hint, never a verdict on its own (see "ML check" below). |
 | Suspicious strings | Encoded PowerShell and download cradles, shadow-copy deletion, Run-key persistence, reverse shells, pipe-to-shell (stronger when aimed at a raw IP), crypto-miner pool URLs, ransom-note text, raw-IP URLs, .onion addresses, big base64 blobs. Everyday mentions (docs, install instructions) are only weak hints, and string hits count one level lower inside compiled binaries. Compressed or encrypted content is skipped, because short patterns match random bytes by chance. |
 
 Each finding has a severity (INFO, LOW, MED, HIGH, CRIT). Findings add up to a 0 to 100 score:
@@ -34,6 +35,9 @@ zscan --json dir > report.json
 zscan -r my_rules/ dir      # use your own YARA rules instead of the bundled ones
 zscan --update              # fetch YARA-Forge rules + MalwareBazaar recent hashes
 zscan --intel suspicious.exe   # also look the hash up online
+pip install -e '.[ml]'      # optional: numpy + lightgbm for the ML check
+zscan --update-ml           # download the EMBER2024 models (about 11 MB)
+zscan --ml -q -j 0 ~/Downloads   # also score ELF, PDF and APK files with them
 ```
 
 Exit codes: `0` clean, `1` suspicious found, `2` malicious found, `3` only errors (or a worker crash),
@@ -98,10 +102,66 @@ VirusTotal's free tier allows 4 requests a minute, so zscan waits 15 s between c
 archives and anything already flagged. Answers are cached for 24 hours. A network failure is a
 warning, not a crash.
 
+### ML check (`--ml`, optional)
+
+Rules and signatures only catch what someone has already seen. `--ml` adds a second opinion for
+**ELF** (Linux programs), **PDF** and **APK** (Android apps) files: a model reads 696 numbers about
+the file (how often each byte value occurs, how random each stretch looks, counts of telltale text
+such as `/bin/`, `http://` or `password`) and answers how much the file resembles malware rather than
+benign programs, from 0 to 1. Windows programs (PE) are not covered yet.
+
+```bash
+pip install -e '.[ml]'     # numpy and lightgbm
+zscan --update-ml          # downloads 3 models, about 11 MB, from huggingface.co into the cache folder
+zscan --ml -v suspicious.elf
+```
+
+```
+SUSPICIOUS score= 15  suspicious.elf
+    type=elf size=912344 entropy=7.1 sha256=...
+    [MED ] ML model: resembles known malware  (score 0.997, EMBER2024 ELF model)
+```
+
+(illustration of the format, not real output)
+
+- **Models and data.** The classifiers published with the [EMBER2024](https://github.com/FutureComputing4AI/EMBER2024)
+  dataset (3.2 million files, Apache-2.0, KDD 2025). zscan trains nothing and stores no malware: the
+  dataset holds numbers computed from files, not the files. zscan recomputes those numbers itself
+  (`zscan/ml/features.py`); see `THIRD_PARTY_NOTICES.md`.
+- **Reading the result.** A score from 0.99 up (change with `--ml-threshold`) is reported as MED, so
+  the file counts as suspicious; from 0.90 as a weak LOW hint. With `-v` every scored file shows its
+  score, and `--json` has an `ml` entry with the model name and score. The check can never make a file
+  *malicious* alone: it is a statistical guess about files nobody has seen, so it only adds to what
+  YARA and the heuristics found. A missing model, or a file too small to judge, is listed under "not
+  fully scanned" instead of passing silently.
+- **Downloads.** `--update-ml` fetches over HTTPS from huggingface.co. A model is installed only after
+  LightGBM can load it and it has the expected 2,568 columns, and its SHA-256 is saved next to it. The
+  expected checksums are not pinned inside zscan yet; that needs one verified download first.
+- **Cost.** Reading each file's text and byte patterns is the slow part. A scan of 3,353 system files
+  (1,794 of them ELF programs, 1.5 GB) with `-j 4` took 56 s with `--ml` instead of 35 s, about 50 ms
+  per program. That was timed with a stand-in model, so the model call itself (one LightGBM
+  prediction per file) is the one part not measured with the real models.
+- **Measuring it yourself.** `python -m zscan.ml.evaluate fetch DIR` downloads EMBER2024's test and
+  challenge data; `... test --kind elf --data DIR/ELF_test.zip --challenge DIR/challenge.zip` reports how
+  much newer malware is caught at what false-alarm rate (the test set is the 12 weeks after the
+  training weeks); `... local --kind elf /usr/bin /opt` scores your own programs to show how many
+  false alarms to expect on your machine. Pick `--ml-threshold` from that.
+
+**What has and has not been checked.** The feature numbers are identical to the official extractor's
+on 1,026 real files from the build machine (446 ELF programs and 580 other files: source code, text,
+archives, images, documents). Every value of all four groups was compared with a verbatim copy of the
+official code; `python -m zscan.ml.verify` repeats that check against an installed copy of the
+official package. The download, loading, scoring, command-line and parallel paths are covered by
+tests that use a small stand-in model. What is **not** measured yet is how well the real models work
+through zscan: the machine this was built on could not reach Hugging Face, so the real models and
+test data were never downloaded. Until `evaluate test` and `evaluate local` have been run, treat the
+default threshold of 0.99 as a provisional guess, and expect that programs unlike the training files
+(distribution packages, custom builds) may score high without being malicious.
+
 ## Tests
 
 ```bash
-pip install -e '.[test]' && pytest
+pip install -e '.[test,ml]' && pytest   # without the ml extra, the ML tests are skipped
 ```
 
 CI runs the suite on Python 3.10 to 3.13. Tests build harmless samples at runtime (the EICAR test
@@ -130,6 +190,8 @@ test data, and members over 64 MiB.
 
 - Static only, so it is easy to evade with obfuscation, and it cannot see behaviour.
 - No rar, 7z or zstd unpacking, no Mach-O structure checks, files over 64 MiB are skipped.
+- The ML check covers ELF, PDF and APK files only (not Windows programs, scripts or Office files) and
+  its accuracy through zscan is not yet measured, see "ML check".
 - Heuristics are tuned on one Linux machine. Expect some noise on other kinds of files.
 - YARA with the community rules is the slow part: roughly 15 files a second per core on system
   binaries (about 50 per core without them).
