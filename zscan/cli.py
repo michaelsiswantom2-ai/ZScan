@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import __version__, intel
 from .config import cache_dir
+from .ml.model import DEFAULT_THRESHOLD, MODEL_LABELS, MlScorer, MlUnavailable, update_models
 from .scanner import Scanner, WorkerCrashed
 from .yara_engine import FORGE_PACKS, YaraEngine, update_community
 
@@ -71,6 +72,22 @@ def run_update(pack: str) -> int:
     return 0 if ok else 3
 
 
+def run_update_ml() -> int:
+    try:
+        metas = update_models()
+    except MlUnavailable as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    except Exception as e:  # noqa: BLE001 - report any failure, e.g. no network
+        print(f"error: could not download the ML models: {e}", file=sys.stderr)
+        return 3
+    for kind, m in metas.items():
+        print(f"EMBER2024 {MODEL_LABELS[kind]} model: {m['trees']} trees, {m['bytes'] / 1e6:.1f} MB, "
+              f"sha256 {m['sha256'][:16]}...")
+    print(f"Cache folder: {cache_dir()}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="zscan", description="Prototype static malware scanner "
                                  "(YARA + heuristics). Never executes scanned files.")
@@ -84,6 +101,16 @@ def main(argv=None) -> int:
                          "recent-hash list into the cache, then exit unless paths are given")
     ap.add_argument("--rule-pack", choices=FORGE_PACKS, default="core",
                     help="YARA-Forge package for --update (default core; full is noisier)")
+    ap.add_argument("--ml", action="store_true",
+                    help="also score ELF, PDF and APK files with machine-learning models trained on the "
+                         "EMBER2024 dataset (needs `pip install 'zscan[ml]'` and `zscan --update-ml`). "
+                         "A statistical guess about unseen files: it adds hints, never a verdict on its own.")
+    ap.add_argument("--ml-threshold", type=float, default=None, metavar="T",
+                    help=f"model score from which a file is reported as suspicious (0.5 to 1, default "
+                         f"{DEFAULT_THRESHOLD}); scores up to 0.09 below it are reported as a weak hint")
+    ap.add_argument("--update-ml", action="store_true",
+                    help="download the EMBER2024 ELF, PDF and APK models (about 11 MB, Hugging Face) "
+                         "into the cache, then exit unless paths are given")
     ap.add_argument("--no-unpack", action="store_true", help="don't look inside zip/tar/gzip files")
     ap.add_argument("--hashlist", action="append", type=Path, default=[],
                     help="file of known-bad hashes, one per line (repeatable)")
@@ -101,12 +128,17 @@ def main(argv=None) -> int:
     ap.add_argument("--version", action="version", version=f"zscan {__version__}")
     a = ap.parse_args(argv)
 
+    code = 0
     if a.update:
         code = run_update(a.rule_pack)
-        if not a.paths:
-            return code
+    if a.update_ml:
+        code = max(code, run_update_ml())
+    if (a.update or a.update_ml) and not a.paths:
+        return code
     if not a.paths:
-        ap.error("give at least one file or directory to scan (or --update)")
+        ap.error("give at least one file or directory to scan (or --update / --update-ml)")
+    if a.ml_threshold is not None and not a.ml:
+        ap.error("--ml-threshold only makes sense together with --ml")
 
     engine = YaraEngine(a.rules, community=not a.no_community)
     if engine.error:
@@ -123,8 +155,19 @@ def main(argv=None) -> int:
     if online and not a.json:
         print(f"intel: looking up hashes with {', '.join(online.sources)}", file=sys.stderr)
 
+    scorer = None
+    if a.ml:
+        try:
+            scorer = MlScorer(DEFAULT_THRESHOLD if a.ml_threshold is None else a.ml_threshold)
+        except (MlUnavailable, ValueError) as e:
+            print(f"error: --ml: {e}", file=sys.stderr)
+            return 3
+        if not a.json:
+            print(f"ml: scoring {', '.join(MODEL_LABELS[k] for k in scorer.models)} files with EMBER2024 "
+                  f"models (suspicious from {scorer.threshold:g})", file=sys.stderr)
+
     scanner = Scanner(engine, max_bytes=a.max_size * 1024 * 1024, unpack=not a.no_unpack,
-                      hash_list=hash_list, online=online)
+                      hash_list=hash_list, online=online, ml=scorer)
     color = sys.stdout.isatty() and not a.no_color
 
     reports = []
