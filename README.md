@@ -11,12 +11,13 @@ opened in memory, never extracted to disk.
 | Check | What it looks for |
 |---|---|
 | Hashes | MD5, SHA-1, SHA-256 of every file |
-| Archives | Looks inside zip (incl. docx, jar, apk, whl), tar, gzip, bzip2 and xz, up to 3 levels deep, in memory. Flags zip bombs (compression beyond 1000:1, overlapping entries) and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. rar, 7z and zstd are recognised but not opened, and say so (see "Not fully scanned"). |
+| Archives | Looks inside zip (incl. docx, jar, apk, whl), tar, gzip, bzip2 and xz, up to 3 levels deep, in memory. Flags zip bombs (overlapping entries, or compression beyond 1000:1 that would expand to 1 GiB or more; smaller members are simply read) and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. rar, 7z and zstd are recognised but not opened, and say so (see "Not fully scanned"). |
 | Community YARA | `zscan --update` downloads the [YARA-Forge](https://github.com/YARAHQ/yara-forge) rule package (about 5,000 curated rules in `core`) and loads it automatically from then on |
 | Bundled YARA | Starter rules in `zscan/rules/` (EICAR, UPX packing for Windows and Linux files, ransomware recovery-blocking commands, injection API strings, Office auto-exec macros, PHP webshells), or your own with `-r` |
 | Threat intel | Offline known-bad hash lists (`--hashlist`, plus the MalwareBazaar list from `--update`). With `--intel`: CIRCL hashlookup (known-good files), MalwareBazaar and VirusTotal. Only hashes are sent, never file contents. |
 | Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content). Per section only for code: compressed icons and debug data are random-looking in normal programs too |
-| PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays. Only files whose MZ header points at a PE header count as Windows programs; DOS and 16-bit programs (`.fon` bitmap fonts, the Win16 stubs in SysWOW64) are typed `dos` and left alone |
+| Signatures (Windows) | Checks with Windows' own WinVerifyTrust, offline, whether a program is validly signed, by its own signature or by a catalog (as most of Windows is). On a validly signed program ZScan's general warning signs are listed but not counted; a program changed after it was signed is flagged (see "Windows signatures" below). |
+| PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays (not counting a signature block). Only files whose MZ header points at a PE header count as Windows programs; DOS and 16-bit programs (`.fon` bitmap fonts, the Win16 stubs in SysWOW64) are typed `dos` and left alone |
 | ELF heuristics (Linux) | Writable+executable segments, entry point outside the executable segments, missing or out-of-file section table, high-entropy code sections, weak import hints (reverse-shell shape, `ptrace`). Uses a small built-in ELF reader (32/64-bit, both byte orders). |
 | ML check (opt-in, `--ml`) | ELF, PDF and APK files are scored by machine-learning models trained on the public EMBER2024 data: how much does this file look like malware rather than like benign programs? Meant for files no rule knows yet. A statistical hint, never a verdict on its own (see "ML check" below). |
 | Suspicious strings | Encoded PowerShell and download cradles, shadow-copy deletion, Run-key persistence, reverse shells, pipe-to-shell (stronger when aimed at a raw IP), crypto-miner pool URLs, ransom-note text, raw-IP URLs, .onion addresses, big base64 blobs. Everyday mentions (docs, install instructions) are only weak hints, and string hits count one level lower inside compiled binaries. Compressed or encrypted content is skipped, because short patterns match random bytes by chance. |
@@ -125,6 +126,32 @@ starting with `#` are ignored). On a whole drive zscan also:
   the cache folder is trusted: the downloaded rule files (`rules/yara-forge.yar`, `.yarc`, `.json`)
   and the report list. Every file skipped this way is listed, so none of it is hidden.
 - sums up cloud-only files by folder, so you can see which sync folder they belong to.
+
+### Windows signatures
+
+On Windows, ZScan asks Windows itself (WinVerifyTrust) whether a program on disk is validly
+signed, by a signature in the file or by one of Windows' catalogs, which sign most of Windows' own
+files. The check stays offline: no revocation lookups and no downloads of certificates, so nothing
+about your files leaves the computer. Certificates that Windows distrusts on its own (its local
+list of known stolen certificates) still fail.
+
+- **Validly signed:** ZScan's general warning signs (imports, sections, entropy, strings, and the
+  bundled UPX and injection-API rules that mirror them) are still listed, marked "not counted:
+  validly signed by ...", but add nothing to the score. These signs describe what plenty of
+  legitimate software does: on one Windows PC, 1,310 of 1,796 flagged files were validly signed,
+  mostly by Microsoft, and most were flagged only for such signs. Malware rules (YARA-Forge and the
+  bundled ones that describe malware), hash lists and the ML check count in full, because signed
+  malware exists. The summary says how many signed programs were not flagged because of this.
+- **Changed after it was signed** (the file no longer matches its signature): MED. Patched,
+  cracked and infected programs look like this.
+- **Signed with a certificate Windows distrusts:** HIGH.
+- **Signature not valid** for another reason (expired without a timestamp, unknown root): noted,
+  and the file counts like an unsigned one.
+
+Programs are checked when they carry an embedded signature (to catch changes) or when they show
+warning signs (to look for a catalog signature). Archive members are not checked. Use
+`--no-signatures` to count signed programs like unsigned ones. JSON reports carry the result as
+`signature` (`status`, `kind`, `signer`, `reason`) for every checked file.
 
 ### Community rules (`--update`)
 
@@ -257,7 +284,8 @@ test data, and members over 64 MiB.
   its accuracy through zscan is not yet measured, see "ML check".
 - Heuristics are tuned on one Linux machine and one Windows PC. Expect some noise on other kinds of
   files. Windows support is new; the tests run on Windows in CI.
-- No Authenticode check yet: a signed program from a known vendor is judged like any other, so
-  packed or protected commercial software shows up as suspicious.
+- Signatures are checked on Windows only, and only for programs on disk, not inside archives.
+  Revocation is not checked (that would need the network), so a signature made with a stolen
+  certificate counts as valid until Windows distrusts that certificate.
 - YARA with the community rules is the slow part: roughly 15 files a second per core on system
   binaries (about 50 per core without them).

@@ -14,11 +14,15 @@ EICAR = (b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$"
          b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*")
 
 
-def build_pe(sections, entry_rva=0x1000, timestamp=0x5F000000, imports=None):
+def build_pe(sections, entry_rva=0x1000, timestamp=0x5F000000, imports=None, overlay=b"",
+             certificate=None):
     """Build a tiny, non-runnable PE32 image for parser tests.
 
-    sections: list of (name: bytes, data: bytes, characteristics: int)
-    imports:  {"KERNEL32.dll": ["FunctionName", ...]}, added as an .idata section
+    sections:    list of (name: bytes, data: bytes, characteristics: int)
+    imports:     {"KERNEL32.dll": ["FunctionName", ...]}, added as an .idata section
+    overlay:     bytes appended after the last section
+    certificate: bytes for a certificate table (where an Authenticode signature lives) at the
+                 very end; only its place in the file is real, not the signature
     """
     file_align, sect_align = 0x200, 0x1000
     import_dir = (0, 0)
@@ -58,7 +62,14 @@ def build_pe(sections, entry_rva=0x1000, timestamp=0x5F000000, imports=None):
     opt += bytes(dirs)
 
     hdr = bytes(dos) + b"PE\x00\x00" + file_hdr + opt + sect_hdrs
-    return hdr.ljust(headers_size, b"\x00") + raw
+    image = bytearray(hdr.ljust(headers_size, b"\x00") + raw + overlay)
+    if certificate is not None:
+        image += b"\x00" * (-len(image) % 8)          # the table starts on an 8-byte boundary
+        offset = len(image)
+        entry = struct.pack("<IHH", 8 + len(certificate), 0x0200, 0x0002) + certificate   # WIN_CERTIFICATE
+        image += entry + b"\x00" * (-len(entry) % 8)
+        struct.pack_into("<II", image, 0x40 + 4 + 20 + 96 + 4 * 8, offset, len(image) - offset)
+    return bytes(image)
 
 
 def _idata(imports: dict, va: int) -> bytes:

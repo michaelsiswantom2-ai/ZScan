@@ -20,6 +20,7 @@ rule UPX_Packed
         description = "Executable packed with UPX (Windows or Linux)"
         severity = 2
         group = "packing"    // one trait with zscan's own packer checks; counted once
+        heuristic = true     // a general warning sign: not counted on validly signed programs
     strings:
         $upx0 = "UPX0"
         $upx1 = "UPX1"
@@ -51,6 +52,7 @@ rule Process_Injection_API_Strings
         description = "Classic remote-thread injection API names present together"
         severity = 3
         group = "injection"  // the same trait as zscan's import-table check; counted once
+        heuristic = true     // a general warning sign: not counted on validly signed programs
     strings:
         $a = "VirtualAllocEx"
         $b = "WriteProcessMemory"

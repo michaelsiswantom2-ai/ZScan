@@ -104,7 +104,8 @@ class YaraEngine:
             for m in matches:
                 sev = int(m.meta.get("severity", 3))
                 out.append(Finding("yara", f"YARA: {m.rule}", sev, m.meta.get("description", ""),
-                                   group=str(m.meta.get("group", ""))))
+                                   group=str(m.meta.get("group", "")),
+                                   heuristic=m.meta.get("heuristic") in (True, 1, "true")))
         if self.community is not None:
             matches, note = _run(self.community, data, 60, "community")
             notes += [note] if note else []

@@ -16,13 +16,24 @@ except ImportError:  # pragma: no cover
     pefile = None
 
 
+# Sources of ZScan's own general warning signs (as opposed to malware rules, hash lists or the
+# ML check). On a validly signed program they are reported but not counted.
+HEURISTIC_SOURCES = {"pe", "entropy", "strings", "elf"}
+
+
 @dataclass
 class Finding:
-    source: str        # "yara", "entropy", "pe", "strings", ...
+    source: str        # "yara", "entropy", "pe", "strings", "signature", ...
     title: str
     severity: int      # 1 = info, 2 = low, 3 = medium, 4 = high, 5 = critical
     detail: str = ""
     group: str = ""    # findings that describe the same trait; only the strongest one counts
+    heuristic: bool = False   # a general warning sign; set for HEURISTIC_SOURCES and heuristic YARA rules
+    not_counted: str = ""     # why this finding does not count toward the score, if it doesn't
+
+    def __post_init__(self):
+        if self.source in HEURISTIC_SOURCES:
+            self.heuristic = True
 
 
 @dataclass
@@ -38,6 +49,7 @@ class FileReport:
     children: list = field(default_factory=list)   # reports for archive members
     unscanned: list = field(default_factory=list)  # what could not be checked, in plain words
     ml: dict | None = None                         # ML check result: {"model": ..., "score": ...}
+    signature: dict | None = None                  # Windows signature check: {"status", "kind", "signer", "reason"}
 
     def iter_tree(self):
         """This report, then every nested archive member, depth first."""
@@ -52,27 +64,39 @@ class FileReport:
 
     @property
     def score(self) -> int:
-        weights = {1: 0, 2: 5, 3: 15, 4: 35, 5: 100}
-        total, strongest = 0, {}
-        for f in self.findings:
-            w = weights.get(f.severity, 0)
-            if f.group:
-                strongest[f.group] = max(strongest.get(f.group, 0), w)
-            else:
-                total += w
-        return min(100, total + sum(strongest.values()))
+        return score_of(f for f in self.findings if not f.not_counted)
 
     @property
     def verdict(self) -> str:
+        return self._verdict([f for f in self.findings if not f.not_counted])
+
+    @property
+    def verdict_if_all_counted(self) -> str:
+        """The verdict had nothing been left uncounted (for example because of a valid signature)."""
+        return self._verdict(self.findings)
+
+    def _verdict(self, findings: list) -> str:
         if self.error:
             return "error"
         if self.skipped:
             return "skipped"
-        if any(f.severity >= 5 for f in self.findings) or self.score >= 70:
+        if any(f.severity >= 5 for f in findings) or score_of(findings) >= 70:
             return "malicious"
-        if self.score >= 15:
+        if score_of(findings) >= 15:
             return "suspicious"
         return "clean"
+
+
+def score_of(findings) -> int:
+    weights = {1: 0, 2: 5, 3: 15, 4: 35, 5: 100}
+    total, strongest = 0, {}
+    for f in findings:
+        w = weights.get(f.severity, 0)
+        if f.group:
+            strongest[f.group] = max(strongest.get(f.group, 0), w)
+        else:
+            total += w
+    return min(100, total + sum(strongest.values()))
 
 
 # ---------------------------------------------------------------- basics
@@ -181,6 +205,25 @@ _COMPILED = [(re.compile(r), t, s) for r, t, s in SUSPICIOUS_PATTERNS]
 _COMPILED_CS = [(re.compile(r), t, s) for r, t, s in CASE_SENSITIVE_PATTERNS]
 
 
+def _looks_like_base64(blob: bytes) -> bool:
+    """Real base64 mixes upper and lower case letters and digits. Letter runs ("JJJJKKKK..."
+    lookup tables) and word lists strung together match the pattern too, but are not."""
+    chars = set(blob)
+    return (len(chars) >= 20 and any(65 <= c <= 90 for c in chars)
+            and any(97 <= c <= 122 for c in chars) and any(48 <= c <= 57 for c in chars))
+
+
+def _first_match(rx, corpus: bytes, title: str):
+    if title != "Large base64 blob":
+        return rx.search(corpus)
+    for i, m in enumerate(rx.finditer(corpus)):
+        if _looks_like_base64(m.group()):
+            return m
+        if i >= 20:
+            return None
+    return None
+
+
 def string_findings(data: bytes) -> list[Finding]:
     out = []
     lowered = data.lower()
@@ -188,7 +231,7 @@ def string_findings(data: bytes) -> list[Finding]:
         for rx, title, sev in patterns:
             if title == "Tor .onion address" and b".onion" not in corpus:
                 continue  # cheap literal prefilter; the regex is slow on big files
-            m = rx.search(corpus)
+            m = _first_match(rx, corpus, title)
             if m:
                 snippet = data[m.start():m.start() + 80].decode("latin-1", "replace")
                 out.append(Finding("strings", title, sev, f"e.g. {snippet!r}"))
@@ -223,6 +266,29 @@ PACKING = "packing"
 # The import-table check and the bundled YARA rule Process_Injection_API_Strings see the same
 # API names (they sit in the import table as plain text), so they share a group too.
 INJECTION = "injection"
+
+
+def certificate_table(data: bytes) -> tuple[int, int] | None:
+    """File offset and size of a PE file's Authenticode signature (its certificate table),
+    or None if it has none. Reads only the headers."""
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None
+    pe = int.from_bytes(data[0x3C:0x40], "little")
+    opt = pe + 24
+    if data[pe:pe + 4] != b"PE\0\0" or len(data) < opt + 2:
+        return None
+    magic = int.from_bytes(data[opt:opt + 2], "little")
+    directories = {0x10B: opt + 96, 0x20B: opt + 112}.get(magic)
+    if directories is None:
+        return None
+    entry = directories + 4 * 8      # IMAGE_DIRECTORY_ENTRY_SECURITY
+    if len(data) < entry + 8 or int.from_bytes(data[directories - 4:directories], "little") <= 4:
+        return None                  # NumberOfRvaAndSizes says there is no such entry
+    offset = int.from_bytes(data[entry:entry + 4], "little")
+    size = int.from_bytes(data[entry + 4:entry + 8], "little")
+    if not offset or not size or offset + size > len(data):
+        return None
+    return offset, size
 
 
 def pe_findings(data: bytes) -> list[Finding]:
@@ -303,11 +369,16 @@ def _pe_findings(data: bytes) -> list[Finding]:
     if ts == 0 or ts > 0x7FFFFFFF:
         out.append(Finding("pe", "Zeroed or invalid compile timestamp", 1))
 
-    # Overlay (data appended after the last section)
+    # Overlay (data appended after the last section). A signed program's Authenticode signature
+    # sits there too, but that is not appended data.
     overlay = pe.get_overlay_data_start_offset()
-    if overlay is not None and len(data) - overlay > 1024:
-        out.append(Finding("pe", "Appended overlay data", 1,
-                           f"{len(data) - overlay} bytes after last section"))
+    if overlay is not None:
+        extra = len(data) - overlay
+        cert = certificate_table(data)
+        if cert and cert[0] >= overlay:
+            extra -= cert[1]
+        if extra > 1024:
+            out.append(Finding("pe", "Appended overlay data", 1, f"{extra} bytes after last section"))
 
     pe.close()
     return out
