@@ -22,6 +22,7 @@ class Finding:
     title: str
     severity: int      # 1 = info, 2 = low, 3 = medium, 4 = high, 5 = critical
     detail: str = ""
+    group: str = ""    # findings that describe the same trait; only the strongest one counts
 
 
 @dataclass
@@ -52,7 +53,14 @@ class FileReport:
     @property
     def score(self) -> int:
         weights = {1: 0, 2: 5, 3: 15, 4: 35, 5: 100}
-        return min(100, sum(weights.get(f.severity, 0) for f in self.findings))
+        total, strongest = 0, {}
+        for f in self.findings:
+            w = weights.get(f.severity, 0)
+            if f.group:
+                strongest[f.group] = max(strongest.get(f.group, 0), w)
+            else:
+                total += w
+        return min(100, total + sum(strongest.values()))
 
     @property
     def verdict(self) -> str:
@@ -186,6 +194,14 @@ PACKER_SECTIONS = {"UPX0", "UPX1", "UPX2", ".aspack", ".adata", ".petite", ".nsp
                    ".nsp1", "MPRESS1", "MPRESS2", ".themida", ".vmp0", ".vmp1"}
 
 
+# Packers and protectors (UPX, Themida, VMProtect...) are common in ordinary commercial software,
+# and one packed file shows several signs of it at once: packer section names, high-entropy and
+# writable+executable sections, a stripped import table. They all describe a single trait, so they
+# share this group and count once, at their strongest: a packed file is suspicious, never
+# malicious on that alone.
+PACKING = "packing"
+
+
 def pe_findings(data: bytes) -> list[Finding]:
     if pefile is None:
         return [Finding("pe", "pefile not installed; PE checks skipped", 1)]
@@ -211,15 +227,15 @@ def _pe_findings(data: bytes) -> list[Finding]:
         writable = bool(chars & 0x80000000)
         executable = bool(chars & 0x20000000)
         if name in PACKER_SECTIONS:
-            out.append(Finding("pe", f"Packer section name '{name}'", 3))
+            out.append(Finding("pe", f"Packer section name '{name}'", 3, group=PACKING))
         if ent > 7.2 and s.SizeOfRawData > 1024:
             out.append(Finding("pe", f"High-entropy section '{name}'", 3,
-                               f"entropy {ent:.2f} (packed or encrypted code?)"))
+                               f"entropy {ent:.2f} (packed or encrypted code?)", group=PACKING))
         if writable and executable:
-            out.append(Finding("pe", f"Section '{name}' is writable and executable", 3))
+            out.append(Finding("pe", f"Section '{name}' is writable and executable", 3, group=PACKING))
         if s.SizeOfRawData == 0 and s.Misc_VirtualSize > 0x10000 and executable:
             out.append(Finding("pe", f"Empty-on-disk executable section '{name}'", 2,
-                               "typical of unpack-at-runtime stubs"))
+                               "typical of unpack-at-runtime stubs", group=PACKING))
 
     # Entry point outside any section, or in the last section
     ep = pe.OPTIONAL_HEADER.AddressOfEntryPoint
@@ -229,7 +245,7 @@ def _pe_findings(data: bytes) -> list[Finding]:
     elif ep_section is not None and pe.sections and ep_section is pe.sections[-1] \
             and len(pe.sections) > 1:
         out.append(Finding("pe", "Entry point in last section", 2,
-                           "common in packed or infected binaries"))
+                           "common in packed or infected binaries", group=PACKING))
 
     # Imports
     imported = set()
@@ -238,7 +254,7 @@ def _pe_findings(data: bytes) -> list[Finding]:
             if imp.name:
                 imported.add(imp.name.decode("latin-1", "replace"))
     if not imported:
-        out.append(Finding("pe", "No import table", 2, "may resolve APIs at runtime"))
+        out.append(Finding("pe", "No import table", 2, "may resolve APIs at runtime", group=PACKING))
     for behaviour, names in SUSPICIOUS_IMPORTS.items():
         hit = sorted(imported & names)
         if len(hit) < 2:

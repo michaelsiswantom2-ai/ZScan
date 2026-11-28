@@ -8,7 +8,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 
-from .analysis import Finding, shannon_entropy
+from .analysis import PACKING, Finding, shannon_entropy
 
 ET_EXEC, ET_DYN = 2, 3
 PT_LOAD = 1
@@ -146,7 +146,7 @@ def elf_findings(data: bytes) -> list[Finding]:
     rwx = [s for s in loads if s.flags & PF_X and s.flags & PF_W]
     if rwx:
         out.append(Finding("elf", "Memory segment is writable and executable", 3,
-                           f"{len(rwx)} segment(s); normal programs keep code read-only"))
+                           f"{len(rwx)} segment(s); normal programs keep code read-only", group=PACKING))
 
     if elf.entry and loads and not any(
             s.flags & PF_X and s.vaddr <= elf.entry < s.vaddr + max(s.memsz, s.filesz) for s in loads):
@@ -155,7 +155,7 @@ def elf_findings(data: bytes) -> list[Finding]:
 
     if elf.shnum == 0:
         out.append(Finding("elf", "No section header table", 2,
-                           "typical of packed or hand-stripped programs"))
+                           "typical of packed or hand-stripped programs", group=PACKING))
     elif not elf.sections_in_file:
         out.append(Finding("elf", "Section header table lies outside the file", 2,
                            "truncated or tampered with"))
@@ -166,7 +166,7 @@ def elf_findings(data: bytes) -> list[Finding]:
             ent = shannon_entropy(data[sec.offset:sec.offset + min(sec.size, ENTROPY_SAMPLE)])
             if ent > 7.2:
                 out.append(Finding("elf", f"High-entropy code section '{sec.name}'", 3,
-                                   f"entropy {ent:.2f} (packed or encrypted code?)"))
+                                   f"entropy {ent:.2f} (packed or encrypted code?)", group=PACKING))
 
     # Weak hints. Legitimate tools (ssh, nc, strace) import these too, so they
     # are LOW and only matter when combined with other findings.

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from . import analysis
-from .analysis import FileReport, Finding
+from .analysis import PACKING, FileReport, Finding
 from .archives import ARCHIVE_TYPES, UNSUPPORTED_ARCHIVES, Budget, Limits, iter_members
 from .elf import elf_findings
 from .ml.model import MODEL_LABELS, MlScorer
@@ -117,7 +117,7 @@ class Scanner:
         # (zip, gzip, pdf streams) are naturally near 8.0.
         if rep.entropy > 7.5 and rep.size > 4096 and rep.file_type in ("pe", "elf", "data", "script"):
             f.append(Finding("entropy", "Very high file entropy", 2,
-                             f"{rep.entropy} bits/byte (encrypted or packed content?)"))
+                             f"{rep.entropy} bits/byte (encrypted or packed content?)", group=PACKING))
 
         if self.ml is not None:
             self._ml_check(rep, data)

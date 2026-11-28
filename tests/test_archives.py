@@ -11,7 +11,7 @@ from zscan.archives import Limits
 from zscan.scanner import Scanner
 from zscan.yara_engine import YaraEngine
 
-from samples import EICAR, benign_pe, make_tar, make_zip, packed_like_pe
+from samples import CODE_RX, DATA_RW, EICAR, benign_pe, build_pe, make_tar, make_zip, packed_like_pe
 from zscan.cli import main
 
 
@@ -127,12 +127,20 @@ def test_tar_xz_holds_tar_holds_eicar(engine, tmp_path):
 
 
 def test_archive_of_a_malicious_by_score_file_is_malicious(engine, tmp_path):
-    """A file can be malicious through several medium findings and no single CRIT one."""
-    inner = packed_like_pe()
+    """A file can be malicious through several independent findings and no single CRIT one:
+    here an entry point outside every section plus ransomware recovery-blocking commands."""
+    inner = build_pe([(b".text", b"\x90" * 300 + b"\xc3", CODE_RX),
+                      (b".data", b"vssadmin delete shadows /all /quiet\x00"
+                                 b"wbadmin delete catalog -quiet\x00", DATA_RW)], entry_rva=0x9000)
     rep = scan(engine, tmp_path, "tool.zip", make_zip({"setup.exe": inner}))
     assert rep.children[0].verdict == "malicious"
     assert not any(f.severity == 5 for f in rep.children[0].findings)
     assert rep.verdict == "malicious"
+
+
+def test_archive_of_a_packed_program_is_only_suspicious(engine, tmp_path):
+    rep = scan(engine, tmp_path, "tool.zip", make_zip({"setup.exe": packed_like_pe()}))
+    assert rep.children[0].verdict == "suspicious" and rep.verdict == "suspicious"
 
 
 @pytest.mark.parametrize("magic,kind,label", [

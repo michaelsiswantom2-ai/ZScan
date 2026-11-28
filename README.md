@@ -23,7 +23,11 @@ opened in memory, never extracted to disk.
 
 Each finding has a severity (INFO, LOW, MED, HIGH, CRIT). Findings add up to a 0 to 100 score:
 any CRIT or a score of 70+ is **malicious**, 15+ is **suspicious**, the rest **clean**. Weak hints
-(LOW) only matter when several pile up.
+(LOW) only matter when several pile up. Findings that describe the same trait count once, at their
+strongest. A packed program (UPX, Themida and the like) shows many signs of packing at once: packer
+section names, high-entropy and writable+executable sections, no import table. Together they count
+as one MED finding, so packing alone makes a file suspicious, never malicious. Plenty of signed
+commercial software is packed.
 
 ## Install and run
 

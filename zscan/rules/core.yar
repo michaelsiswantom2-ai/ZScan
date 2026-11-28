@@ -19,6 +19,7 @@ rule UPX_Packed
     meta:
         description = "Executable packed with UPX (Windows or Linux)"
         severity = 2
+        group = "packing"    // one trait with zscan's own packer checks; counted once
     strings:
         $upx0 = "UPX0"
         $upx1 = "UPX1"
