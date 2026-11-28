@@ -93,10 +93,22 @@ def run_update_ml() -> int:
     return 0
 
 
+def read_path_list(path: Path) -> list:
+    """Paths listed one per line. PowerShell 5 writes UTF-16 with `>` and UTF-8 with a BOM with
+    `Set-Content -Encoding utf8`, so both are read."""
+    raw = path.read_bytes()
+    text = raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig")
+    return [Path(line.strip()) for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="zscan", description="Prototype static malware scanner "
                                  "(YARA + heuristics). Never executes scanned files.")
     ap.add_argument("paths", nargs="*", type=Path, help="files or directories to scan")
+    ap.add_argument("--files-from", type=Path, metavar="FILE",
+                    help="also scan the files and directories listed in FILE, one per line "
+                         "(UTF-8 or UTF-16; blank lines and lines starting with # are ignored)")
     ap.add_argument("-r", "--rules", action="append", type=Path,
                     help="YARA rule file or directory (repeatable; replaces the bundled rules)")
     ap.add_argument("--no-community", action="store_true",
@@ -137,6 +149,11 @@ def main(argv=None) -> int:
     ap.add_argument("--version", action="version", version=f"zscan {__version__}")
     a = ap.parse_args(argv)
     _never_fail_on_odd_names()
+    if a.files_from:
+        try:
+            a.paths += read_path_list(a.files_from)
+        except (OSError, UnicodeError) as e:
+            ap.error(f"--files-from: cannot read {a.files_from}: {getattr(e, 'strerror', None) or e}")
 
     code = 0
     if a.update:

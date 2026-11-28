@@ -38,6 +38,7 @@ pip install -e .            # needs yara-python and pefile, Python 3.10+
 zscan path/to/file_or_dir   # or: python -m zscan ...
 zscan -q -j 0 ~/Downloads   # only show non-clean files, one worker per CPU core
 zscan --json dir > report.json
+zscan --files-from flagged.txt   # scan the paths listed in a file, one per line
 zscan -r my_rules/ dir      # use your own YARA rules instead of the bundled ones
 zscan --update              # fetch YARA-Forge rules + MalwareBazaar recent hashes
 zscan --intel suspicious.exe   # also look the hash up online
@@ -98,7 +99,9 @@ zscan -q -j 0 --progress -o ~/zscan-report.txt /home /usr /opt /etc /var    # Li
 
 `-o FILE` writes the report as UTF-8, so file names in any language come through, and leaves the
 report itself out of the scan. The summary line still appears on screen. `--progress` prints a
-line every 30 seconds. On a whole drive zscan also:
+line every 30 seconds. To check only what an earlier scan flagged, list those paths in a file, one
+per line, and pass it with `--files-from` (UTF-8 or UTF-16, so PowerShell's `>` works; lines
+starting with `#` are ignored). On a whole drive zscan also:
 
 - skips Windows cloud-only files (OneDrive "online-only" files and similar) instead of reading
   them, because reading one makes Windows download it. They are counted as skipped, "cloud-only".

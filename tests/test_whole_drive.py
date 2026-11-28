@@ -147,3 +147,24 @@ def test_progress_lines(tmp_path, monkeypatch, capsys):
     main(["--no-community", "--progress", str(tmp_path)])
     err = capsys.readouterr().err
     assert "progress: 1 files in 0:00:00" in err and "progress: 3 files" in err
+
+
+def test_files_from_a_list(tmp_path, capsys):
+    # For scanning again only what an earlier scan flagged. The list may come from PowerShell,
+    # whose `>` writes UTF-16.
+    tree = make_tree(tmp_path / "tree", {"eicar.com": EICAR, THAI: b"hello", "other.txt": b"not listed"})
+    listing = tmp_path / "flagged.txt"
+    listing.write_text(f"# flagged last time\n{tree / 'eicar.com'}\n\n  {tree / THAI}  \n"
+                       f"{tree / 'gone.exe'}\n", encoding="utf-16")
+    assert main(["--no-community", "--json", "--files-from", str(listing)]) == 2
+    data = json.loads(capsys.readouterr().out)
+    assert sorted(Path(f["path"]).name for f in data["files"]) == sorted(["eicar.com", THAI])
+    assert data["summary"]["malicious"] == 1 and data["summary"]["error"] == 1      # gone.exe
+    listing.write_text(f"{tree / 'other.txt'}\n", encoding="utf-8-sig")
+    assert main(["--no-community", "-q", "--no-color", "--files-from", str(listing)]) == 0
+
+
+def test_files_from_a_missing_list_is_an_error(tmp_path, capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["--no-community", "--files-from", str(tmp_path / "nope.txt")])
+    assert e.value.code == 2 and "--files-from: cannot read" in capsys.readouterr().err
