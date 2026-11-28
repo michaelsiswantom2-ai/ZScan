@@ -14,6 +14,7 @@ import pytest
 import zscan.analysis
 import zscan.scanner as scanner_mod
 from zscan.analysis import detect_type
+from zscan.archives import Limits
 from zscan.cli import main
 from zscan.scanner import OWN_FILE, OWN_HISTORY, Scanner, reports_registry
 from zscan.yara_engine import DEFAULT_RULES, YaraEngine
@@ -92,13 +93,21 @@ def test_well_compressed_office_images_are_not_zip_bombs(scanner, tmp_path):
     assert [c.path.split("!")[-1] for c in rep.children] == ["ppt/media/image1.emf"]   # it was unpacked
 
 
-def test_many_bomb_like_members_count_once(scanner, tmp_path):
-    # A game data pack full of empty terrain tiles: five members at 1000:1 used to add up to
-    # "malicious". It is one trait of the file, so it counts once.
+def test_many_bomb_like_members_count_once(tmp_path):
+    # Five bomb-like members used to add up to "malicious". It is one trait of the file, so it
+    # counts once. (A bomb expands to gigabytes; the limit is lowered here instead.)
+    tiles = {f"terrain/tile{i}.dds": b"\0" * (4 * 1024 * 1024) for i in range(5)}
+    small_bombs = Scanner(YaraEngine(community=False), limits=Limits(bomb_bytes=2 * 1024 * 1024))
+    rep = scan(small_bombs, tmp_path, "terraintexture.pak", make_zip(tiles))
+    assert titles(rep).count("Possible zip bomb") == 6      # each member, and the archive as a whole
+    assert rep.score == 15 and rep.verdict == "suspicious"
+
+
+def test_a_game_pack_of_empty_tiles_is_read_not_flagged(scanner, tmp_path):
     tiles = {f"terrain/tile{i}.dds": b"\0" * (4 * 1024 * 1024) for i in range(5)}
     rep = scan(scanner, tmp_path, "terraintexture.pak", make_zip(tiles))
-    assert titles(rep).count("Possible zip bomb") == 5
-    assert rep.score == 15 and rep.verdict == "suspicious"
+    assert "Possible zip bomb" not in titles(rep) and len(rep.children) == 5
+    assert rep.verdict == "clean" and not rep.partly_scanned
 
 
 # ------------------------------------------------------------ ZScan's own files

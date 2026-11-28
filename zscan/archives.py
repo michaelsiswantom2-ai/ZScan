@@ -29,9 +29,12 @@ class Limits:
     max_members: int = 10000      # per archive (about 1 ms each)
     max_member_bytes: int = 64 * 1024 * 1024
     max_total_bytes: int = 256 * 1024 * 1024   # uncompressed, per top-level file
-    # Uncompressed / compressed, for members over 1 MiB. Deflate tops out near 1030:1, which only
-    # long runs of one byte reach; images in Office files and game data packs stay far below.
+    # Uncompressed / compressed. Deflate tops out near 1030:1, which only long runs of one byte
+    # reach. Members that fit the limits above are simply read, however well they compress (game
+    # packs are full of empty terrain tiles), so extreme compression is a zip-bomb sign only when
+    # the archive or a member would expand to bomb_bytes or more.
     max_ratio: int = 1000
+    bomb_bytes: int = 1024 * 1024 * 1024
 
 
 @dataclass
@@ -86,14 +89,18 @@ def _zip_members(data: bytes, budget: Budget) -> Iterator[Member]:
         # no normal zip tool writes them. Don't unpack anything.
         yield Member("", bomb=4, note=f"overlapping entries ({overlap}), not unpacked")
         return
+    total, ctotal = sum(i.file_size for i in infos), max(sum(i.compress_size for i in infos), 1)
+    if total >= lim.bomb_bytes and total / ctotal > lim.max_ratio:
+        yield Member("", bomb=3, note=f"the whole archive expands to {_gib(total)} "
+                                      f"({total // ctotal}:1); only what fits the limits is read")
     for info in infos:
         if info.flag_bits & 0x1:
             yield Member(info.filename, encrypted=True, note="password-protected")
             continue
         size, csize = info.file_size, max(info.compress_size, 1)
-        if size > 1024 * 1024 and size / csize > lim.max_ratio:
+        if size >= lim.bomb_bytes and size / csize > lim.max_ratio:
             yield Member(info.filename, bomb=3,
-                         note=f"compression ratio {size // csize}:1, not unpacked")
+                         note=f"expands to {_gib(size)} ({size // csize}:1), not unpacked")
             continue
         if size > lim.max_member_bytes:
             yield Member(info.filename, note=f"larger than {lim.max_member_bytes // 2**20} MiB, skipped")
@@ -114,6 +121,10 @@ def _zip_members(data: bytes, budget: Budget) -> Iterator[Member]:
             yield Member(info.filename, body)
         except Exception as e:  # noqa: BLE001 - zlib.error, BadZipFile, lzma/bz2 errors, ...
             yield Member(info.filename, note=f"unreadable: {type(e).__name__}: {e}")
+
+
+def _gib(n: int) -> str:
+    return f"{n / 2**30:.1f} GiB"
 
 
 def _accept_separator_spelling(data: bytes, info) -> None:

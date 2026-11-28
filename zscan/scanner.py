@@ -8,7 +8,7 @@ from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from . import analysis
+from . import analysis, signature
 from .analysis import PACKING, FileReport, Finding
 from .archives import ARCHIVE_TYPES, UNSUPPORTED_ARCHIVES, ZIP_BOMB, Budget, Limits, iter_members
 from .config import cache_dir
@@ -133,7 +133,8 @@ class Scanner:
 
     def __init__(self, yara_engine: YaraEngine | None = None, max_bytes: int = MAX_BYTES_DEFAULT,
                  unpack: bool = True, limits: Limits | None = None,
-                 hash_list=None, online=None, ml: MlScorer | None = None, own_hashes=None):
+                 hash_list=None, online=None, ml: MlScorer | None = None, own_hashes=None,
+                 signatures: bool = True):
         self.yara = yara_engine or YaraEngine()
         self.max_bytes = max_bytes
         self.unpack = unpack
@@ -142,6 +143,7 @@ class Scanner:
         self.online = online         # intel.OnlineIntel or None
         self.ml = ml                 # ml.model.MlScorer or None (opt-in --ml)
         self.own_hashes = own_file_hashes(self.yara) if own_hashes is None else frozenset(own_hashes)
+        self.signatures = signatures   # check Windows signatures of programs on disk
 
     # ------------------------------------------------------------ phase 1: analyse
 
@@ -160,7 +162,37 @@ class Scanner:
         except OSError as e:
             rep.error = f"cannot read: {e.strerror or e}"
             return rep
-        return self.analyze_bytes(data, str(path), Budget(self.limits), depth=0)
+        rep = self.analyze_bytes(data, str(path), Budget(self.limits), depth=0)
+        if self.signatures and rep.file_type == "pe" and not rep.skipped:
+            self._signature_check(rep, path, data)
+        return rep
+
+    def _signature_check(self, rep: FileReport, path: Path, data: bytes) -> None:
+        """Windows signatures (see signature.py). On a validly signed program ZScan's own general
+        warning signs are listed but not counted: they describe what plenty of legitimate
+        software does. Malware rules, hash lists and the ML check still count in full."""
+        warnings = [f for f in rep.findings if f.heuristic and f.severity >= 2]
+        if not warnings and analysis.certificate_table(data) is None:
+            return      # nothing a signature could change, and no embedded signature to verify
+        sig = signature.check(path)
+        if sig is None:
+            return
+        rep.signature = sig.as_dict()
+        signer = sig.signer or "an unnamed signer"
+        if sig.status == signature.VALID:
+            for f in warnings:
+                f.not_counted = f"validly signed by {signer}"
+            rep.findings.append(Finding("signature", f"Validly signed by {signer}", 1, f"{sig.kind} signature"))
+        elif sig.status == signature.MISMATCH:
+            rep.findings.append(Finding("signature", "Changed after it was signed", 3,
+                                        f"the file no longer matches the signature of {signer}: "
+                                        "patched, cracked or infected?"))
+        elif sig.status == signature.DISTRUSTED:
+            rep.findings.append(Finding("signature", "Signed with a certificate Windows distrusts", 4, signer))
+        elif sig.status == signature.UNTRUSTED:
+            rep.findings.append(Finding("signature", "Signature not valid", 1, f"{sig.reason} ({signer})"))
+        elif warnings:
+            rep.findings.append(Finding("signature", "Not signed", 1))
 
     def analyze_bytes(self, data: bytes, display: str, budget: Budget, depth: int) -> FileReport:
         rep = FileReport(path=display, size=len(data))
@@ -337,7 +369,7 @@ class Scanner:
         config = {"rule_paths": getattr(self.yara, "rule_paths", None),
                   "community": getattr(self.yara, "use_community", True),
                   "max_bytes": self.max_bytes, "unpack": self.unpack, "limits": self.limits,
-                  "own_hashes": self.own_hashes,
+                  "own_hashes": self.own_hashes, "signatures": self.signatures,
                   "ml": ({"threshold": self.ml.threshold, "directory": str(self.ml.directory)}
                          if self.ml is not None else None)}
         pool = _new_pool(jobs, config)
@@ -483,7 +515,7 @@ def _worker_init(config: dict) -> None:
     scorer = MlScorer(ml["threshold"], Path(ml["directory"])) if ml else None
     _WORKER = Scanner(YaraEngine(config["rule_paths"], community=config["community"]),
                       max_bytes=config["max_bytes"], unpack=config["unpack"], limits=config["limits"],
-                      ml=scorer, own_hashes=config["own_hashes"])
+                      ml=scorer, own_hashes=config["own_hashes"], signatures=config["signatures"])
 
 
 def _worker_probe() -> bool:

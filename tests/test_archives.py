@@ -66,11 +66,25 @@ def test_depth_limit(engine, tmp_path):
     assert rep.verdict != "malicious"  # EICAR was never reached
 
 
+# A real bomb expands to gigabytes; the tests lower that limit instead of building one.
+BOMB_LIMITS = Limits(bomb_bytes=8 * 1024 * 1024)
+
+
 def test_zip_bomb_not_unpacked(engine, tmp_path):
-    rep = scan(engine, tmp_path, "bomb.zip", make_zip({"zeros.bin": b"\0" * (20 * 1024 * 1024)}))
+    rep = scan(engine, tmp_path, "bomb.zip", make_zip({"zeros.bin": b"\0" * (20 * 1024 * 1024)}),
+               limits=BOMB_LIMITS)
     assert rep.children == []
     assert any(f.title == "Possible zip bomb" for f in rep.findings)
     assert rep.verdict == "suspicious"
+
+
+def test_extreme_compression_that_fits_the_limits_is_read(engine, tmp_path):
+    # Empty terrain tiles in game packs compress at about 1030:1, like a bomb, but they are small.
+    tile = b"\0" * (4 * 1024 * 1024) + b"vssadmin delete shadows /all /quiet & wbadmin delete catalog -quiet"
+    rep = scan(engine, tmp_path, "terraintexture.pak", make_zip({"tile0_0.raw": tile}))
+    assert "Possible zip bomb" not in [f.title for f in rep.findings]
+    assert [c.path.split("!")[-1] for c in rep.children] == ["tile0_0.raw"]
+    assert rep.children[0].verdict != "clean"      # it was read, so what it hides is found
 
 
 def test_encrypted_member_flagged(engine, tmp_path):
@@ -171,5 +185,6 @@ def test_gaps_in_coverage_are_recorded(engine, tmp_path):
     assert rep.partly_scanned
     assert any("nested more than 2 levels" in n for node in rep.iter_tree() for n in node.unscanned)
 
-    bomb = scan(engine, tmp_path, "bomb.zip", make_zip({"zeros.bin": b"\0" * (20 * 1024 * 1024)}))
+    bomb = scan(engine, tmp_path, "bomb.zip", make_zip({"zeros.bin": b"\0" * (20 * 1024 * 1024)}),
+                limits=BOMB_LIMITS)
     assert bomb.partly_scanned

@@ -33,13 +33,18 @@ def render_text(rep, verbose: bool, color: bool) -> str:
         lines.append(f"    - skipped: {rep.skipped}")
         return "\n".join(lines)
     if verbose or v != "clean":
+        sig = rep.signature
+        signed = ""
+        if sig:
+            signed = f" signature={sig['status']}" + (f" ({sig['signer']})" if sig.get("signer") else "")
         lines.append(f"    type={rep.file_type} size={rep.size} entropy={rep.entropy} "
-                     f"sha256={rep.hashes.get('sha256', '')}")
+                     f"sha256={rep.hashes.get('sha256', '')}{signed}")
         for f in rep.findings:
             if f.severity == 1 and not verbose:
                 continue
             detail = f"  ({f.detail})" if f.detail else ""
-            lines.append(f"    [{SEV_LABEL[f.severity]:4}] {f.title}{detail}")
+            uncounted = f"  [not counted: {f.not_counted}]" if f.not_counted else ""
+            lines.append(f"    [{SEV_LABEL[f.severity]:4}] {f.title}{detail}{uncounted}")
     if rep.unscanned:
         # Say so even for "clean" files: a gap in coverage should never be silent.
         shown = rep.unscanned[:3]
@@ -129,6 +134,8 @@ def main(argv=None) -> int:
                     help="download the EMBER2024 ELF, PDF and APK models (about 11 MB, Hugging Face) "
                          "into the cache, then exit unless paths are given")
     ap.add_argument("--no-unpack", action="store_true", help="don't look inside zip/tar/gzip files")
+    ap.add_argument("--no-signatures", action="store_true",
+                    help="don't check Windows signatures: signed programs then count like unsigned ones")
     ap.add_argument("--hashlist", action="append", type=Path, default=[],
                     help="file of known-bad hashes, one per line (repeatable)")
     ap.add_argument("--intel", action="store_true",
@@ -194,7 +201,7 @@ def main(argv=None) -> int:
                   f"models (suspicious from {scorer.threshold:g})", file=sys.stderr)
 
     scanner = Scanner(engine, max_bytes=a.max_size * 1024 * 1024, unpack=not a.no_unpack,
-                      hash_list=hash_list, online=online, ml=scorer)
+                      hash_list=hash_list, online=online, ml=scorer, signatures=not a.no_signatures)
 
     paths, missing = [], 0
     for target in a.paths:
@@ -225,6 +232,7 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
     partial = 0
     counts = {"clean": 0, "suspicious": 0, "malicious": 0, "skipped": 0, "error": missing}
     skipped_why: Counter = Counter()
+    signed_quiet = 0            # validly signed programs not flagged only because of their signature
     unreadable: list = []       # folders that could not be opened, so their files went unscanned
     crashed: list = []          # files that crashed a scan worker, so they went unscanned
     own: list = []              # skipped as ZScan's own files: listed, so nothing hides there unseen
@@ -250,6 +258,8 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
         for rep in scanner.scan_many(all_files(), jobs):
             counts[rep.verdict] += 1
             partial += rep.partly_scanned
+            if rep.verdict == "clean" and rep.verdict_if_all_counted != "clean":
+                signed_quiet += 1
             if rep.skipped:
                 skipped_why[rep.skipped] += 1
             if rep.error == CRASHED:
@@ -287,6 +297,7 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
 
     if a.json:
         summary = dict(counts, partly_scanned=partial, skipped_reasons=dict(skipped_why),
+                       signed_not_flagged=signed_quiet,
                        unreadable_folders=len(unreadable), crashed=len(crashed), stopped_early=stopped)
         json.dump({"summary": summary, "files": [to_dict(r) for r in reports],
                    "unreadable_folders": unreadable, "crashed_files": crashed, "own_files": own,
@@ -325,6 +336,8 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
                 + (f"; {partial} not fully scanned" if partial else "")
                 + ("; skipped: " + ", ".join(f"{n} {why}" for why, n in skipped_why.most_common())
                    if skipped_why else "")
+                + (f"; {signed_quiet} validly signed program(s) with only general warning signs "
+                   "not flagged" if signed_quiet else "")
                 + (f"; {len(unreadable)} folder(s) could not be opened" if unreadable else "")
                 + (f"; {len(crashed)} file(s) crashed a scan worker" if crashed else "")
                 + ("; STOPPED EARLY" if stopped else ""))
