@@ -18,6 +18,8 @@ from typing import Iterator
 ARCHIVE_TYPES = {"zip", "tar", "gzip", "bzip2", "xz"}
 # Recognised, but zscan cannot open them; reported as "not fully scanned".
 UNSUPPORTED_ARCHIVES = {"rar": "RAR", "7z": "7-Zip", "zstd": "Zstandard"}
+# Finding group for zip-bomb signs: an archive with many bomb-like members is one trait, counted once.
+ZIP_BOMB = "zip-bomb"
 
 
 @dataclass
@@ -26,7 +28,9 @@ class Limits:
     max_members: int = 10000      # per archive (about 1 ms each)
     max_member_bytes: int = 64 * 1024 * 1024
     max_total_bytes: int = 256 * 1024 * 1024   # uncompressed, per top-level file
-    max_ratio: int = 200          # uncompressed / compressed, for members over 1 MiB
+    # Uncompressed / compressed, for members over 1 MiB. Deflate tops out near 1030:1, which only
+    # long runs of one byte reach; images in Office files and game data packs stay far below.
+    max_ratio: int = 1000
 
 
 @dataclass
@@ -35,7 +39,7 @@ class Member:
     data: bytes | None = None     # None when the member was not read
     note: str | None = None       # why it was not read, or other remark
     encrypted: bool = False
-    bomb: bool = False
+    bomb: int = 0                 # severity of a zip-bomb sign: 3 extreme compression, 4 a forged layout
 
 
 class Budget:
@@ -79,7 +83,7 @@ def _zip_members(data: bytes, budget: Budget) -> Iterator[Member]:
     if overlap:
         # Entries that share bytes are how "non-recursive" zip bombs are built;
         # no normal zip tool writes them. Don't unpack anything.
-        yield Member("", bomb=True, note=f"overlapping entries ({overlap}), not unpacked")
+        yield Member("", bomb=4, note=f"overlapping entries ({overlap}), not unpacked")
         return
     for info in infos:
         if info.flag_bits & 0x1:
@@ -87,7 +91,7 @@ def _zip_members(data: bytes, budget: Budget) -> Iterator[Member]:
             continue
         size, csize = info.file_size, max(info.compress_size, 1)
         if size > 1024 * 1024 and size / csize > lim.max_ratio:
-            yield Member(info.filename, bomb=True,
+            yield Member(info.filename, bomb=3,
                          note=f"compression ratio {size // csize}:1, not unpacked")
             continue
         if size > lim.max_member_bytes:
@@ -103,7 +107,7 @@ def _zip_members(data: bytes, budget: Budget) -> Iterator[Member]:
                 with zf.open(info) as fh:
                     body = fh.read(size + 1)
             if len(body) > size:
-                yield Member(info.filename, bomb=True, note="member larger than its header says")
+                yield Member(info.filename, bomb=4, note="member larger than its header says")
                 continue
             yield Member(info.filename, body)
         except Exception as e:  # noqa: BLE001 - zlib.error, BadZipFile, lzma/bz2 errors, ...
@@ -171,7 +175,7 @@ def _stream_member(data: bytes, file_type: str, budget: Budget) -> Iterator[Memb
         return
     if len(body) > cap:
         ratio = len(body) // max(len(data), 1)
-        yield Member("(decompressed)", bomb=ratio > lim.max_ratio,
+        yield Member("(decompressed)", bomb=3 if ratio > lim.max_ratio else 0,
                      note=f"decompresses to more than {cap // 2**20} MiB, not scanned")
         return
     budget.take(len(body))

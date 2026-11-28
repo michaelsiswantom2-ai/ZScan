@@ -67,7 +67,7 @@ def test_packed_like_pe(scanner, tmp_path):
     t = titles(rep)
     assert "Packer section name 'UPX1'" in t
     assert "Section 'UPX1' is writable and executable" in t
-    assert any(x.startswith("High-entropy section") for x in t)
+    assert any(x.startswith("High-entropy code section") for x in t)
     assert "YARA: UPX_Packed" in t
     # Many signs of one trait (packing) count once: a packed program is suspicious, not
     # malicious. Plenty of signed commercial software is packed with UPX or Themida.

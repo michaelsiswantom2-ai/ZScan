@@ -43,11 +43,12 @@ def test_cloud_only_files_are_skipped_without_reading_them(tmp_path, monkeypatch
     f = tmp_path / "Documents" / "big-video.mp4"
     make_tree(tmp_path, {"Documents/big-video.mp4": EICAR})
     monkeypatch.setattr(scanner_mod, "not_local", lambda st: True)
+    scanner = Scanner(YaraEngine(community=False))     # reads its own rule files, so before the trap
 
     def must_not_read(self):
         raise AssertionError(f"read {self}, which would download it")
     monkeypatch.setattr(Path, "read_bytes", must_not_read)
-    rep = Scanner(YaraEngine(community=False)).scan_file(f)
+    rep = scanner.scan_file(f)
     assert rep.verdict == "skipped" and rep.skipped == CLOUD_ONLY
 
 

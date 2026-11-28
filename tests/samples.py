@@ -14,12 +14,19 @@ EICAR = (b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$"
          b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*")
 
 
-def build_pe(sections, entry_rva=0x1000, timestamp=0x5F000000):
+def build_pe(sections, entry_rva=0x1000, timestamp=0x5F000000, imports=None):
     """Build a tiny, non-runnable PE32 image for parser tests.
 
     sections: list of (name: bytes, data: bytes, characteristics: int)
+    imports:  {"KERNEL32.dll": ["FunctionName", ...]}, added as an .idata section
     """
     file_align, sect_align = 0x200, 0x1000
+    import_dir = (0, 0)
+    if imports:
+        idata_va = sect_align * (len(sections) + 1)
+        idata = _idata(imports, idata_va)
+        sections = list(sections) + [(b".idata", idata, 0xC0000040)]
+        import_dir = (idata_va, len(idata))
     n = len(sections)
     headers_size = 0x40 + 4 + 20 + 224 + 40 * n
     headers_size = (headers_size + file_align - 1) // file_align * file_align
@@ -46,10 +53,41 @@ def build_pe(sections, entry_rva=0x1000, timestamp=0x5F000000):
                       sect_align, file_align, 6, 0, 0, 0, 6, 0, 0,
                       size_of_image, headers_size, 0, 2, 0,
                       0x100000, 0x1000, 0x100000, 0x1000, 0, 16)
-    opt += b"\x00" * (16 * 8)
+    dirs = bytearray(16 * 8)
+    struct.pack_into("<II", dirs, 8, *import_dir)     # data directory 1: the import table
+    opt += bytes(dirs)
 
     hdr = bytes(dos) + b"PE\x00\x00" + file_hdr + opt + sect_hdrs
     return hdr.ljust(headers_size, b"\x00") + raw
+
+
+def _idata(imports: dict, va: int) -> bytes:
+    """An import directory laid out at RVA `va`: descriptors, then the lookup and address
+    tables (identical), then the hint/name entries and DLL names they point at."""
+    dlls = list(imports.items())
+    desc_size = 20 * (len(dlls) + 1)
+    thunks_size = sum(4 * (len(funcs) + 1) for _, funcs in dlls)
+    names_at = desc_size + 2 * thunks_size
+    names = bytearray()
+    func_rvas, dll_rvas = [], []
+    for _, funcs in dlls:
+        rvas = []
+        for f in funcs:
+            rvas.append(va + names_at + len(names))
+            entry = b"\0\0" + f.encode() + b"\0"
+            names += entry + (b"\0" if len(entry) % 2 else b"")
+        func_rvas.append(rvas)
+    for dll, _ in dlls:
+        dll_rvas.append(va + names_at + len(names))
+        names += dll.encode() + b"\0"
+    desc, thunks, off = bytearray(), bytearray(), 0
+    for rvas, dll_rva in zip(func_rvas, dll_rvas):
+        desc += struct.pack("<IIIII", va + desc_size + off, 0, 0, dll_rva, va + desc_size + thunks_size + off)
+        arr = b"".join(struct.pack("<I", r) for r in rvas) + b"\0\0\0\0"
+        thunks += arr
+        off += len(arr)
+    desc += bytes(20)
+    return bytes(desc + thunks + thunks + names)
 
 
 CODE_RX = 0x60000020   # code | execute | read

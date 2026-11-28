@@ -50,6 +50,7 @@ rule Process_Injection_API_Strings
     meta:
         description = "Classic remote-thread injection API names present together"
         severity = 3
+        group = "injection"  // the same trait as zscan's import-table check; counted once
     strings:
         $a = "VirtualAllocEx"
         $b = "WriteProcessMemory"

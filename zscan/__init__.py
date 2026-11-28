@@ -1,2 +1,2 @@
 """zscan: a prototype static malware scanner (YARA + heuristics)."""
-__version__ = "0.5.1"
+__version__ = "0.5.2"

@@ -13,7 +13,7 @@ from pathlib import Path
 from . import __version__, intel
 from .config import cache_dir
 from .ml.model import DEFAULT_THRESHOLD, MODEL_LABELS, MlScorer, MlUnavailable, update_models
-from .scanner import Scanner, WorkerCrashed
+from .scanner import CRASHED, Scanner, WorkerCrashed
 from .yara_engine import FORGE_PACKS, YaraEngine, update_community
 
 SEV_LABEL = {1: "INFO", 2: "LOW", 3: "MED", 4: "HIGH", 5: "CRIT"}
@@ -208,6 +208,8 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
     counts = {"clean": 0, "suspicious": 0, "malicious": 0, "skipped": 0, "error": missing}
     skipped_why: Counter = Counter()
     unreadable: list = []       # folders that could not be opened, so their files went unscanned
+    crashed: list = []          # files that crashed a scan worker, so they went unscanned
+    stopped = None              # why the scan ended early, if it did
     jobs = (os.cpu_count() or 1) if a.jobs == 0 else max(1, a.jobs)
     if len(paths) == 1 and paths[0].is_file():
         jobs = 1    # starting workers for a single file only slows it down
@@ -230,6 +232,8 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
             partial += rep.partly_scanned
             if rep.skipped:
                 skipped_why[rep.skipped] += 1
+            if rep.error == CRASHED:
+                crashed.append(rep.path)
             if a.progress and time.monotonic() - last >= PROGRESS_EVERY:
                 last = time.monotonic()
                 print(f"progress: {sum(counts.values()):,} files in {_minutes(last - started)} "
@@ -245,8 +249,9 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
                     continue
                 print(render_text(node, a.verbose, color), file=out)
     except WorkerCrashed as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 3
+        # Still write the summary: everything before this point was scanned properly.
+        stopped = f"the scan stopped early: {e}"
+        print(f"error: {stopped}", file=sys.stderr)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
@@ -258,9 +263,9 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
 
     if a.json:
         summary = dict(counts, partly_scanned=partial, skipped_reasons=dict(skipped_why),
-                       unreadable_folders=len(unreadable))
+                       unreadable_folders=len(unreadable), crashed=len(crashed), stopped_early=stopped)
         json.dump({"summary": summary, "files": [to_dict(r) for r in reports],
-                   "unreadable_folders": unreadable}, out, indent=2)
+                   "unreadable_folders": unreadable, "crashed_files": crashed}, out, indent=2)
         print(file=out)
     else:
         if unreadable:
@@ -270,18 +275,30 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
                 print(f"    {line}", file=out)
             if len(unreadable) > 20:
                 print(f"    ... and {len(unreadable) - 20} more", file=out)
+        if crashed:
+            # Usually a bug in a native library (YARA, a decompressor) hit by an odd file.
+            print(f"\nFiles that crashed a scan worker ({len(crashed)}), so they were not scanned:", file=out)
+            for path in crashed:
+                print(f"    {path}", file=out)
+        if stopped:
+            print(f"\nNOTE: {stopped}. Files after the last one listed were not scanned.", file=out)
         total = sum(counts.values())
         line = (f"Scanned {total} file(s) in {_minutes(time.monotonic() - started)}: "
                 + ", ".join(f"{v} {k}" for k, v in counts.items())
                 + (f"; {partial} not fully scanned" if partial else "")
                 + ("; skipped: " + ", ".join(f"{n} {why}" for why, n in skipped_why.most_common())
                    if skipped_why else "")
-                + (f"; {len(unreadable)} folder(s) could not be opened" if unreadable else ""))
+                + (f"; {len(unreadable)} folder(s) could not be opened" if unreadable else "")
+                + (f"; {len(crashed)} file(s) crashed a scan worker" if crashed else "")
+                + ("; STOPPED EARLY" if stopped else ""))
         print("\n" + line, file=out)
         if out is not sys.stdout:
             print(line + f"\nreport written to {a.output}", file=sys.stderr)
 
-    # Exit codes: 0 clean, 1 suspicious, 2 malicious found, 3 errors only
+    # Exit codes: 0 clean, 1 suspicious, 2 malicious found, 3 errors only,
+    # 4 the scan stopped early (what it reported is only part of the files)
+    if stopped:
+        return 4
     if counts["malicious"]:
         return 2
     if counts["suspicious"]:

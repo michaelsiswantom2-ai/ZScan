@@ -10,10 +10,10 @@ from typing import Iterable, Iterator
 
 from . import analysis
 from .analysis import PACKING, FileReport, Finding
-from .archives import ARCHIVE_TYPES, UNSUPPORTED_ARCHIVES, Budget, Limits, iter_members
+from .archives import ARCHIVE_TYPES, UNSUPPORTED_ARCHIVES, ZIP_BOMB, Budget, Limits, iter_members
 from .elf import elf_findings
 from .ml.model import MODEL_LABELS, MlScorer
-from .yara_engine import YaraEngine
+from .yara_engine import YaraEngine, community_dir
 
 MAX_BYTES_DEFAULT = 64 * 1024 * 1024
 BINARY_TYPES = {"pe", "elf", "macho", "macho-fat"}
@@ -30,6 +30,7 @@ _FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
 _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
 _NOT_LOCAL = _FILE_ATTRIBUTE_OFFLINE | _FILE_ATTRIBUTE_RECALL_ON_OPEN | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
 CLOUD_ONLY = "cloud-only (not downloaded)"
+OWN_FILE = "ZScan's own file (its rules or code)"
 _IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003     # directory junctions and mounted volumes
 
 
@@ -49,6 +50,30 @@ def is_junction(path: str) -> bool:
         return False
 
 
+def own_file_hashes(engine: YaraEngine | None) -> frozenset:
+    """SHA-256 of ZScan's own files on this machine: the code that is running, the YARA rule
+    files it loaded and the downloaded community rules. Rule files are full of the very strings
+    they look for, so scanning them only produces alarms about ZScan itself. Matching by exact
+    content (not by folder) also catches copies, for example inside a pip-cached wheel, and
+    leaves no folder where something else could hide unscanned."""
+    import hashlib
+    import sys
+    files = set()
+    for name, mod in list(sys.modules.items()):
+        if name == __package__ or name.startswith(__package__ + "."):
+            files.update(getattr(mod, attr, None) for attr in ("__file__", "__cached__"))
+    if engine is not None:
+        files.update(getattr(engine, "rule_files", []))
+    files.update(str(community_dir() / f"yara-forge{ext}") for ext in (".yar", ".yarc", ".json"))
+    out = set()
+    for f in files:
+        try:
+            out.add(hashlib.sha256(Path(f).read_bytes()).hexdigest())
+        except (OSError, TypeError):
+            pass
+    return frozenset(out)
+
+
 class Scanner:
     """Two phases, so the slow part can run in worker processes:
 
@@ -60,7 +85,7 @@ class Scanner:
 
     def __init__(self, yara_engine: YaraEngine | None = None, max_bytes: int = MAX_BYTES_DEFAULT,
                  unpack: bool = True, limits: Limits | None = None,
-                 hash_list=None, online=None, ml: MlScorer | None = None):
+                 hash_list=None, online=None, ml: MlScorer | None = None, own_hashes=None):
         self.yara = yara_engine or YaraEngine()
         self.max_bytes = max_bytes
         self.unpack = unpack
@@ -68,6 +93,7 @@ class Scanner:
         self.hash_list = hash_list   # intel.HashList or None
         self.online = online         # intel.OnlineIntel or None
         self.ml = ml                 # ml.model.MlScorer or None (opt-in --ml)
+        self.own_hashes = own_file_hashes(self.yara) if own_hashes is None else frozenset(own_hashes)
 
     # ------------------------------------------------------------ phase 1: analyse
 
@@ -91,6 +117,9 @@ class Scanner:
     def analyze_bytes(self, data: bytes, display: str, budget: Budget, depth: int) -> FileReport:
         rep = FileReport(path=display, size=len(data))
         rep.hashes = analysis.hashes(data)
+        if rep.hashes["sha256"] in self.own_hashes:
+            rep.skipped = OWN_FILE
+            return rep
         rep.entropy = round(analysis.shannon_entropy(data), 3)
         rep.file_type = analysis.detect_type(data)
 
@@ -164,7 +193,7 @@ class Scanner:
             if m.encrypted:
                 encrypted.append(m.name)
             elif m.bomb:
-                rep.findings.append(Finding("archive", "Possible zip bomb", 4, label))
+                rep.findings.append(Finding("archive", "Possible zip bomb", m.bomb, label, group=ZIP_BOMB))
                 skipped.append(label)
             elif m.data is None:
                 skipped.append(label)
@@ -194,7 +223,7 @@ class Scanner:
 
     def _intel(self, rep: FileReport) -> None:
         sha = rep.hashes.get("sha256")
-        if not sha:
+        if not sha or rep.skipped:      # ZScan's own files carry hashes but were not scanned
             return
         if self.hash_list is not None:
             rep.findings += self.hash_list.lookup(rep.hashes)
@@ -260,12 +289,11 @@ class Scanner:
         config = {"rule_paths": getattr(self.yara, "rule_paths", None),
                   "community": getattr(self.yara, "use_community", True),
                   "max_bytes": self.max_bytes, "unpack": self.unpack, "limits": self.limits,
+                  "own_hashes": self.own_hashes,
                   "ml": ({"threshold": self.ml.threshold, "directory": str(self.ml.directory)}
                          if self.ml is not None else None)}
-        # "spawn" behaves the same on every OS and avoids forking a process that already holds YARA state.
-        pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn"),
-                                   initializer=_worker_init, initargs=(config,))
-        in_flight: dict = {}     # future -> position in the input
+        pool = _new_pool(jobs, config)
+        in_flight: dict = {}     # future -> (position in the input, path)
         ready: dict = {}         # position -> finished report waiting for its turn
         submitted = next_out = 0
         source = iter(paths)
@@ -280,17 +308,35 @@ class Scanner:
                     except StopIteration:
                         exhausted = True
                         break
-                    in_flight[pool.submit(_worker_scan, str(path))] = submitted
+                    in_flight[pool.submit(_worker_scan, str(path))] = (submitted, path)
                     submitted += 1
                 if not in_flight:
                     break
                 done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
+                lost = []
                 for future in done:
+                    pos, path = in_flight.pop(future)
                     try:
-                        ready[in_flight.pop(future)] = future.result()
-                    except BrokenProcessPool as e:
-                        raise WorkerCrashed("a scan worker process died unexpectedly "
-                                            "(a file crashed it); rerun with --jobs 1 to find which") from e
+                        ready[pos] = future.result()
+                    except BrokenProcessPool:
+                        lost.append((pos, path))
+                    except Exception as e:  # noqa: BLE001 - e.g. a result that could not be sent back
+                        ready[pos] = _failed(path, f"internal error: {type(e).__name__}: {e}")
+                if lost:
+                    # A worker died, most likely because a native library (YARA, a decompressor)
+                    # crashed on some file, and it took the whole pool with it. Keep whatever
+                    # finished, then scan every file that was still in flight again, one at a
+                    # time, so the file that does it is found and all the others get scanned.
+                    pool.shutdown(wait=True, cancel_futures=True)
+                    for future, (pos, path) in in_flight.items():
+                        if future.done() and not future.cancelled() and future.exception() is None:
+                            ready[pos] = future.result()
+                        else:
+                            lost.append((pos, path))
+                    in_flight.clear()
+                    for pos, rep in _isolate(sorted(lost), config):
+                        ready[pos] = rep
+                    pool = _new_pool(jobs, config)
                 while next_out in ready:       # hand results out in input order
                     yield self.finalize(ready.pop(next_out))
                     next_out += 1
@@ -299,7 +345,61 @@ class Scanner:
 
 
 class WorkerCrashed(RuntimeError):
-    """A worker process died, for example from a crash inside a native library."""
+    """Scan workers keep dying even without a file to blame, so the scan cannot go on."""
+
+
+CRASHED = "a scan worker crashed on this file, so it was not scanned"
+# Tests only: a worker exits abruptly on files whose name contains this text ("*" means every
+# scan, including the start-up probe). Lets tests imitate a native crash without a real one.
+_CRASH_FOR_TESTS = os.environ.get("ZSCAN_TEST_CRASH_ON", "")
+
+
+def _failed(path, why: str) -> FileReport:
+    rep = FileReport(path=str(path))
+    rep.error = why
+    return rep
+
+
+def _new_pool(jobs: int, config: dict) -> ProcessPoolExecutor:
+    # "spawn" behaves the same on every OS and avoids forking a process that already holds YARA state.
+    return ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn"),
+                               initializer=_worker_init, initargs=(config,))
+
+
+def _isolate(items: list, config: dict) -> Iterator[tuple]:
+    """Scan each (position, path) on its own in a one-worker pool. A file whose worker dies is
+    reported as an error and the pool is replaced. If a fresh worker cannot even scan a few
+    harmless bytes, the workers themselves are broken rather than any file: give up."""
+    pool = None
+    try:
+        for pos, path in items:
+            if pool is None:
+                pool = _new_pool(1, config)
+            try:
+                rep = pool.submit(_worker_scan, str(path)).result()
+            except BrokenProcessPool:
+                pool.shutdown(wait=True, cancel_futures=True)
+                pool = None
+                if not _workers_start(config):
+                    raise WorkerCrashed("scan workers crash even on a harmless test input, so the "
+                                        "problem is not one file; try --jobs 1") from None
+                rep = _failed(path, CRASHED)
+            except Exception as e:  # noqa: BLE001
+                rep = _failed(path, f"internal error: {type(e).__name__}: {e}")
+            yield pos, rep
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _workers_start(config: dict) -> bool:
+    pool = _new_pool(1, config)
+    try:
+        return pool.submit(_worker_probe).result()
+    except BrokenProcessPool:
+        return False
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 _WORKER: Scanner | None = None
@@ -311,14 +411,21 @@ def _worker_init(config: dict) -> None:
     scorer = MlScorer(ml["threshold"], Path(ml["directory"])) if ml else None
     _WORKER = Scanner(YaraEngine(config["rule_paths"], community=config["community"]),
                       max_bytes=config["max_bytes"], unpack=config["unpack"], limits=config["limits"],
-                      ml=scorer)
+                      ml=scorer, own_hashes=config["own_hashes"])
+
+
+def _worker_probe() -> bool:
+    if _CRASH_FOR_TESTS == "*":
+        os._exit(70)
+    _WORKER.analyze_bytes(b"zscan worker probe", "probe", Budget(_WORKER.limits), 0)
+    return True
 
 
 def _worker_scan(path: str) -> FileReport:
+    if _CRASH_FOR_TESTS and (_CRASH_FOR_TESTS == "*" or _CRASH_FOR_TESTS in os.path.basename(path)):
+        os._exit(70)
     try:
         return _WORKER.analyze_file(Path(path))
     except Exception as e:  # noqa: BLE001 - one bad file must not stop the whole scan
-        rep = FileReport(path=path)
-        rep.error = f"internal error: {type(e).__name__}: {e}"
-        return rep
+        return _failed(path, f"internal error: {type(e).__name__}: {e}")
 

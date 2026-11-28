@@ -11,11 +11,11 @@ opened in memory, never extracted to disk.
 | Check | What it looks for |
 |---|---|
 | Hashes | MD5, SHA-1, SHA-256 of every file |
-| Archives | Looks inside zip (incl. docx, jar, apk, whl), tar, gzip, bzip2 and xz, up to 3 levels deep, in memory. Flags zip bombs (extreme compression ratios, overlapping entries) and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. rar, 7z and zstd are recognised but not opened, and say so (see "Not fully scanned"). |
+| Archives | Looks inside zip (incl. docx, jar, apk, whl), tar, gzip, bzip2 and xz, up to 3 levels deep, in memory. Flags zip bombs (compression beyond 1000:1, overlapping entries) and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. rar, 7z and zstd are recognised but not opened, and say so (see "Not fully scanned"). |
 | Community YARA | `zscan --update` downloads the [YARA-Forge](https://github.com/YARAHQ/yara-forge) rule package (about 5,000 curated rules in `core`) and loads it automatically from then on |
 | Bundled YARA | Starter rules in `zscan/rules/` (EICAR, UPX packing for Windows and Linux files, ransomware recovery-blocking commands, injection API strings, Office auto-exec macros, PHP webshells), or your own with `-r` |
 | Threat intel | Offline known-bad hash lists (`--hashlist`, plus the MalwareBazaar list from `--update`). With `--intel`: CIRCL hashlookup (known-good files), MalwareBazaar and VirusTotal. Only hashes are sent, never file contents. |
-| Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content) |
+| Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content). Per section only for code: compressed icons and debug data are random-looking in normal programs too |
 | PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays |
 | ELF heuristics (Linux) | Writable+executable segments, entry point outside the executable segments, missing or out-of-file section table, high-entropy code sections, weak import hints (reverse-shell shape, `ptrace`). Uses a small built-in ELF reader (32/64-bit, both byte orders). |
 | ML check (opt-in, `--ml`) | ELF, PDF and APK files are scored by machine-learning models trained on the public EMBER2024 data: how much does this file look like malware rather than like benign programs? Meant for files no rule knows yet. A statistical hint, never a verdict on its own (see "ML check" below). |
@@ -27,7 +27,9 @@ any CRIT or a score of 70+ is **malicious**, 15+ is **suspicious**, the rest **c
 strongest. A packed program (UPX, Themida and the like) shows many signs of packing at once: packer
 section names, high-entropy and writable+executable sections, no import table. Together they count
 as one MED finding, so packing alone makes a file suspicious, never malicious. Plenty of signed
-commercial software is packed.
+commercial software is packed. The same goes for the injection API names (the import check and the
+bundled YARA rule see the same names, MED at most, and debuggers, overlays and anti-cheat import them
+too) and for zip-bomb signs (a game data pack with many extremely compressed members is one trait).
 
 ## Install and run
 
@@ -44,8 +46,9 @@ zscan --update-ml           # download the EMBER2024 models (about 11 MB)
 zscan --ml -q -j 0 ~/Downloads   # also score ELF, PDF and APK files with them
 ```
 
-Exit codes: `0` clean, `1` suspicious found, `2` malicious found, `3` only errors (or a worker crash),
-`130` interrupted.
+Exit codes: `0` clean, `1` suspicious found, `2` malicious found, `3` only errors (unreadable files
+or folders, or files that crashed a scan worker), `4` the scan stopped early (scan workers kept
+crashing, so only part of the files were scanned; the summary says so), `130` interrupted.
 
 Example (real output):
 
@@ -77,8 +80,14 @@ Files over `--max-size` are listed as `skipped`.
 `-j N` runs the analysis in N worker processes (`-j 0` is one per CPU core). Results come out in
 the same order and are identical to a single-process scan. Hash lookups and archive roll-ups stay
 in the main process, so online lookups keep their rate limits. On 4 cores a scan of `/usr/bin` with
-community rules loaded went from 51 s to 16 s. If a worker crashes zscan stops with a clear error
-(exit 3); rerun with `-j 1` to find the file.
+community rules loaded went from 51 s to 16 s.
+
+If a file crashes a worker (a bug in a native library such as YARA or a decompressor can take the
+whole process down), zscan scans every file that was in flight again, one at a time, so it finds the
+one that does it. That file is reported as an error and listed under "Files that crashed a scan
+worker" (`crashed_files` in JSON), and the scan carries on. Only if a fresh worker cannot even scan a
+few harmless bytes does zscan stop, with exit code 4 and the summary of what it did scan. This needs
+`-j 2` or more: with `-j 1` everything runs in one process, so such a crash ends the scan.
 
 ### Scanning a whole computer
 
@@ -100,6 +109,12 @@ line every 30 seconds. On a whole drive zscan also:
   else was found, that makes the exit code 3.
 - keeps going when a file name cannot be shown on the console (Thai names on an English Windows
   code page, say): those characters are printed as escapes.
+- recognises its own files (the code that is running, the YARA rule files it loaded, the downloaded
+  community rules) and copies of them, for example inside a pip-cached wheel, and lists them as
+  skipped, "ZScan's own file". Rule files are full of the very strings they look for. Matching is
+  by exact content, never by name or folder: an edited copy is scanned like any other file. The
+  three downloaded files in the cache folder (`rules/yara-forge.yar`, `.yarc`, `.json`) are taken as
+  they are on disk, so whatever sits under those names in the cache folder is skipped.
 
 ### Community rules (`--update`)
 
@@ -220,8 +235,9 @@ test data, and members over 64 MiB.
 - No rar, 7z or zstd unpacking, no Mach-O structure checks, files over 64 MiB are skipped.
 - The ML check covers ELF, PDF and APK files only (not Windows programs, scripts or Office files) and
   its accuracy through zscan is not yet measured, see "ML check".
-- Heuristics are tuned on one Linux machine. Expect some noise on other kinds of files. Windows
-  support is new: the tests run on Windows in CI, but zscan has not yet been checked against a whole
-  Windows PC.
+- Heuristics are tuned on one Linux machine and one Windows PC. Expect some noise on other kinds of
+  files. Windows support is new; the tests run on Windows in CI.
+- No Authenticode check yet: a signed program from a known vendor is judged like any other, so
+  packed or protected commercial software shows up as suspicious.
 - YARA with the community rules is the slow part: roughly 15 files a second per core on system
   binaries (about 50 per core without them).

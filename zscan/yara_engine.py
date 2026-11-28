@@ -59,6 +59,7 @@ class YaraEngine:
         self.local = None
         self.community = None
         self.community_info: dict = {}
+        self.rule_files: list[str] = []      # local rule files, so scans can recognise them
         self.error = None
         if yara is None:
             self.error = "yara-python not installed; YARA matching disabled"
@@ -69,6 +70,7 @@ class YaraEngine:
             candidates = sorted(p.rglob("*.yar")) + sorted(p.rglob("*.yara")) if p.is_dir() else [p]
             for f in candidates:
                 files[f"{f.stem}_{len(files)}"] = str(f)
+        self.rule_files = list(files.values())
         if files:
             self.local = yara.compile(filepaths=files)
         else:

@@ -200,6 +200,9 @@ PACKER_SECTIONS = {"UPX0", "UPX1", "UPX2", ".aspack", ".adata", ".petite", ".nsp
 # share this group and count once, at their strongest: a packed file is suspicious, never
 # malicious on that alone.
 PACKING = "packing"
+# The import-table check and the bundled YARA rule Process_Injection_API_Strings see the same
+# API names (they sit in the import table as plain text), so they share a group too.
+INJECTION = "injection"
 
 
 def pe_findings(data: bytes) -> list[Finding]:
@@ -228,8 +231,10 @@ def _pe_findings(data: bytes) -> list[Finding]:
         executable = bool(chars & 0x20000000)
         if name in PACKER_SECTIONS:
             out.append(Finding("pe", f"Packer section name '{name}'", 3, group=PACKING))
-        if ent > 7.2 and s.SizeOfRawData > 1024:
-            out.append(Finding("pe", f"High-entropy section '{name}'", 3,
+        # Only code counts: compressed icons in .rsrc, packed data and the compressed debug
+        # sections of MinGW and Go programs ("/19", "/32") are high-entropy in normal programs.
+        if ent > 7.2 and s.SizeOfRawData > 1024 and (executable or chars & 0x20):
+            out.append(Finding("pe", f"High-entropy code section '{name}'", 3,
                                f"entropy {ent:.2f} (packed or encrypted code?)", group=PACKING))
         if writable and executable:
             out.append(Finding("pe", f"Section '{name}' is writable and executable", 3, group=PACKING))
@@ -266,10 +271,12 @@ def _pe_findings(data: bytes) -> list[Finding]:
                 continue
             sev = 2
         elif behaviour == "process injection":
-            sev = 4 if len(hit) >= 3 else 3
+            # Debuggers, game overlays, anti-cheat and accessibility tools import these too.
+            sev = 3 if len(hit) >= 3 else 2
         else:
             sev = 2
-        out.append(Finding("pe", f"Imports suggest {behaviour}", sev, ", ".join(hit)))
+        out.append(Finding("pe", f"Imports suggest {behaviour}", sev, ", ".join(hit),
+                           group=INJECTION if behaviour == "process injection" else ""))
 
     # Timestamp sanity
     ts = pe.FILE_HEADER.TimeDateStamp
