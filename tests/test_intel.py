@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from zscan import intel
 from zscan.cli import main
 from zscan.scanner import Scanner
@@ -88,8 +90,28 @@ def test_vt_skipped_for_plain_clean_text(monkeypatch, tmp_path):
 
 
 def test_bazaar_list_update():
-    body = b"# header\n" + EICAR_SHA256.encode() + b"\nnot-a-hash\n"
-    path, n = intel.update_bazaar_list(http=lambda url, timeout=60: (200, body))
-    assert n == 1
+    # The recent export is a CSV; the SHA-256 is the first 64-hex value in each row, next to
+    # MD5, SHA-1, imphash and TLSH values of other lengths (a TLSH run must not be mistaken for one).
+    tlsh = "T1" + "a" * 70
+    body = (b'# MalwareBazaar recent\n# "first_seen_utc","sha256_hash","md5_hash","sha1_hash"\n'
+            + f'"2026-11-28 01:02:03","{EICAR_SHA256}","{"b" * 32}","{"c" * 40}","x","{tlsh}"\n'.encode()
+            + f'"2026-11-28 01:02:04","{"d" * 32}","{tlsh}"\n'.encode() + b"not-a-row\n")
+    asked = []
+    path, n = intel.update_bazaar_list(http=lambda url, timeout=60: asked.append(url) or (200, body),
+                                       key="k/ey")
+    assert n == 1 and asked == ["https://mb-api.abuse.ch/v2/files/exports/k%2Fey/recent.csv"]
     hl = intel.HashList(intel.default_hash_lists())
     assert hl.lookup({"sha256": EICAR_SHA256})[0].severity == 5
+
+
+def test_bazaar_list_needs_a_key(monkeypatch):
+    monkeypatch.delenv("MALWAREBAZAAR_API_KEY", raising=False)
+    monkeypatch.delenv("ABUSE_CH_AUTH_KEY", raising=False)
+    with pytest.raises(intel.NoAuthKey, match="Auth-Key"):
+        intel.update_bazaar_list(http=lambda url, timeout=60: (200, b""))
+
+
+def test_bazaar_errors_never_show_the_key():
+    with pytest.raises(OSError) as e:
+        intel.update_bazaar_list(http=lambda url, timeout=60: (410, b"gone"), key="secret-key-123")
+    assert "410" in str(e.value) and "secret-key-123" not in str(e.value)

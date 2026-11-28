@@ -109,8 +109,11 @@ download is broken, the previous rules stay in place. YARA-Forge `score` maps to
 85+ CRIT, 70+ HIGH, 60+ MED, lower LOW. Use `--no-community` to scan without them. The rules
 come from many authors under their own licenses, so they are downloaded, not stored in this repo.
 
-`--update` also tries to save MalwareBazaar's recent SHA-256 list (last 48 hours, CC0) as an
-offline hash list that is checked on every scan.
+`--update` also saves MalwareBazaar's recent SHA-256 list (last 48 hours, CC0) as an offline hash
+list that is checked on every scan. abuse.ch now requires a free Auth-Key for it, so this step runs
+only when `MALWAREBAZAAR_API_KEY` is set (the same key `--intel` uses), and is skipped with a note
+otherwise. The keyed download is written from abuse.ch's documentation and has not yet been tried
+against the live service.
 
 ### Online hash lookups (`--intel`)
 

@@ -69,6 +69,8 @@ def run_update(pack: str) -> int:
     try:
         path, n = intel.update_bazaar_list()
         print(f"MalwareBazaar recent hashes: {n} saved to {path}")
+    except intel.NoAuthKey as e:
+        print(f"note: skipped the MalwareBazaar hash list: {e}", file=sys.stderr)
     except Exception as e:  # noqa: BLE001
         print(f"warning: could not fetch MalwareBazaar hash list: {e}", file=sys.stderr)
     print(f"Cache folder: {cache_dir()}")
