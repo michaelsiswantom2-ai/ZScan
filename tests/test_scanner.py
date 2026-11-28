@@ -67,13 +67,32 @@ def test_packed_like_pe(scanner, tmp_path):
     t = titles(rep)
     assert "Packer section name 'UPX1'" in t
     assert "Section 'UPX1' is writable and executable" in t
-    assert any(x.startswith("High-entropy section") for x in t)
+    assert any(x.startswith("High-entropy code section") for x in t)
     assert "YARA: UPX_Packed" in t
-    assert rep.verdict in ("suspicious", "malicious")
+    # Many signs of one trait (packing) count once: a packed program is suspicious, not
+    # malicious. Plenty of signed commercial software is packed with UPX or Themida.
+    assert rep.verdict == "suspicious" and rep.score == 15
+
+
+def test_findings_of_one_group_count_once():
+    from zscan.analysis import FileReport, Finding
+    rep = FileReport(path="x", findings=[Finding("pe", "a", 3, group="packing"),
+                                         Finding("pe", "b", 3, group="packing"),
+                                         Finding("pe", "c", 2, group="packing")])
+    assert rep.score == 15 and rep.verdict == "suspicious"
+    rep.findings.append(Finding("pe", "Imports suggest process injection", 4))
+    assert rep.score == 50
+    rep.findings.append(Finding("pe", "Entry point outside all sections", 4))
+    assert rep.score == 85 and rep.verdict == "malicious"
 
 
 def test_truncated_pe(scanner, tmp_path):
-    rep = scanner.scan_file(write(tmp_path, "broken.exe", b"MZ" + b"\x00" * 10))
+    # The MZ header points at "PE\0\0", so Windows would try to load it, but the rest is missing.
+    header = bytearray(0x40)
+    header[:2] = b"MZ"
+    header[0x3C] = 0x40
+    rep = scanner.scan_file(write(tmp_path, "broken.exe", bytes(header) + b"PE\0\0"))
+    assert rep.file_type == "pe"
     assert "Malformed PE header" in titles(rep)
 
 

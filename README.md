@@ -11,19 +11,25 @@ opened in memory, never extracted to disk.
 | Check | What it looks for |
 |---|---|
 | Hashes | MD5, SHA-1, SHA-256 of every file |
-| Archives | Looks inside zip (incl. docx, jar, apk, whl), tar, gzip, bzip2 and xz, up to 3 levels deep, in memory. Flags zip bombs (extreme compression ratios, overlapping entries) and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. rar, 7z and zstd are recognised but not opened, and say so (see "Not fully scanned"). |
+| Archives | Looks inside zip (incl. docx, jar, apk, whl), tar, gzip, bzip2 and xz, up to 3 levels deep, in memory. Flags zip bombs (compression beyond 1000:1, overlapping entries) and password-protected members. An archive takes the verdict of its worst member, shown as `outer.zip!inner/file.exe`. rar, 7z and zstd are recognised but not opened, and say so (see "Not fully scanned"). |
 | Community YARA | `zscan --update` downloads the [YARA-Forge](https://github.com/YARAHQ/yara-forge) rule package (about 5,000 curated rules in `core`) and loads it automatically from then on |
 | Bundled YARA | Starter rules in `zscan/rules/` (EICAR, UPX packing for Windows and Linux files, ransomware recovery-blocking commands, injection API strings, Office auto-exec macros, PHP webshells), or your own with `-r` |
 | Threat intel | Offline known-bad hash lists (`--hashlist`, plus the MalwareBazaar list from `--update`). With `--intel`: CIRCL hashlookup (known-good files), MalwareBazaar and VirusTotal. Only hashes are sent, never file contents. |
-| Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content) |
-| PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays |
+| Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content). Per section only for code: compressed icons and debug data are random-looking in normal programs too |
+| PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays. Only files whose MZ header points at a PE header count as Windows programs; DOS and 16-bit programs (`.fon` bitmap fonts, the Win16 stubs in SysWOW64) are typed `dos` and left alone |
 | ELF heuristics (Linux) | Writable+executable segments, entry point outside the executable segments, missing or out-of-file section table, high-entropy code sections, weak import hints (reverse-shell shape, `ptrace`). Uses a small built-in ELF reader (32/64-bit, both byte orders). |
 | ML check (opt-in, `--ml`) | ELF, PDF and APK files are scored by machine-learning models trained on the public EMBER2024 data: how much does this file look like malware rather than like benign programs? Meant for files no rule knows yet. A statistical hint, never a verdict on its own (see "ML check" below). |
 | Suspicious strings | Encoded PowerShell and download cradles, shadow-copy deletion, Run-key persistence, reverse shells, pipe-to-shell (stronger when aimed at a raw IP), crypto-miner pool URLs, ransom-note text, raw-IP URLs, .onion addresses, big base64 blobs. Everyday mentions (docs, install instructions) are only weak hints, and string hits count one level lower inside compiled binaries. Compressed or encrypted content is skipped, because short patterns match random bytes by chance. |
 
 Each finding has a severity (INFO, LOW, MED, HIGH, CRIT). Findings add up to a 0 to 100 score:
 any CRIT or a score of 70+ is **malicious**, 15+ is **suspicious**, the rest **clean**. Weak hints
-(LOW) only matter when several pile up.
+(LOW) only matter when several pile up. Findings that describe the same trait count once, at their
+strongest. A packed program (UPX, Themida and the like) shows many signs of packing at once: packer
+section names, high-entropy and writable+executable sections, no import table. Together they count
+as one MED finding, so packing alone makes a file suspicious, never malicious. Plenty of signed
+commercial software is packed. The same goes for the injection API names (the import check and the
+bundled YARA rule see the same names, MED at most, and debuggers, overlays and anti-cheat import them
+too) and for zip-bomb signs (a game data pack with many extremely compressed members is one trait).
 
 ## Install and run
 
@@ -32,6 +38,7 @@ pip install -e .            # needs yara-python and pefile, Python 3.10+
 zscan path/to/file_or_dir   # or: python -m zscan ...
 zscan -q -j 0 ~/Downloads   # only show non-clean files, one worker per CPU core
 zscan --json dir > report.json
+zscan --files-from flagged.txt   # scan the paths listed in a file, one per line
 zscan -r my_rules/ dir      # use your own YARA rules instead of the bundled ones
 zscan --update              # fetch YARA-Forge rules + MalwareBazaar recent hashes
 zscan --intel suspicious.exe   # also look the hash up online
@@ -40,8 +47,9 @@ zscan --update-ml           # download the EMBER2024 models (about 11 MB)
 zscan --ml -q -j 0 ~/Downloads   # also score ELF, PDF and APK files with them
 ```
 
-Exit codes: `0` clean, `1` suspicious found, `2` malicious found, `3` only errors (or a worker crash),
-`130` interrupted.
+Exit codes: `0` clean, `1` suspicious found, `2` malicious found, `3` only errors (unreadable files
+or folders, or files that crashed a scan worker), `4` the scan stopped early (scan workers kept
+crashing, so only part of the files were scanned; the summary says so), `130` interrupted.
 
 Example (real output):
 
@@ -73,19 +81,68 @@ Files over `--max-size` are listed as `skipped`.
 `-j N` runs the analysis in N worker processes (`-j 0` is one per CPU core). Results come out in
 the same order and are identical to a single-process scan. Hash lookups and archive roll-ups stay
 in the main process, so online lookups keep their rate limits. On 4 cores a scan of `/usr/bin` with
-community rules loaded went from 51 s to 16 s. If a worker crashes zscan stops with a clear error
-(exit 3); rerun with `-j 1` to find the file.
+community rules loaded went from 51 s to 16 s.
+
+If a file crashes a worker (a bug in a native library such as YARA or a decompressor can take the
+whole process down), zscan scans every file that was in flight again, one at a time, so it finds the
+one that does it. That file is reported as an error and listed under "Files that crashed a scan
+worker" (`crashed_files` in JSON), and the scan carries on. Only if a fresh worker cannot even scan a
+few harmless bytes does zscan stop, with exit code 4 and the summary of what it did scan. This needs
+`-j 2` or more: with `-j 1` everything runs in one process, so such a crash ends the scan.
+
+### Scanning a whole computer
+
+```bash
+zscan -q -j 0 --progress -o C:\zscan-report.txt C:\       # Windows, one drive at a time
+zscan -q -j 0 --progress -o ~/zscan-report.txt /home /usr /opt /etc /var    # Linux
+```
+
+`-o FILE` writes the report as UTF-8, so file names in any language come through, and leaves the
+report itself out of the scan. The summary line still appears on screen. `--progress` prints a
+line every 30 seconds. To check only what an earlier scan flagged, list those paths in a file, one
+per line, and pass it with `--files-from` (UTF-8 or UTF-16, so PowerShell's `>` works; lines
+starting with `#` are ignored). On a whole drive zscan also:
+
+- skips Windows cloud-only files (OneDrive "online-only" files and similar) instead of reading
+  them, because reading one makes Windows download it. They are counted as skipped, "cloud-only".
+- does not follow folder links (symlinks, and directory junctions on Windows), so nothing is
+  scanned twice and a link loop cannot trap it.
+- lists every folder it could not open, for example system folders that need administrator
+  rights, under "Folders that could not be opened" instead of leaving them out quietly. If nothing
+  else was found, that makes the exit code 3.
+- keeps going when a file name cannot be shown on the console (Thai names on an English Windows
+  code page, say): those characters are printed as escapes.
+- recognises its own files and copies of them, for example inside a pip-cached wheel, and lists
+  them as skipped, "ZScan's own file", under "Skipped as ZScan's own files" (`own_files` in JSON).
+  Rule files are full of the very strings they look for, and reports quote what they found, so
+  scanning them only raises alarms about ZScan itself. It knows: its own package folder (the code,
+  including bytecode for any Python version, its rules and lists; any other kind of file there is
+  scanned), the YARA rule files it loaded, the downloaded community rules, every file from its own history that it
+  would flag (`zscan/own-history.sha256`, so copies of older versions count too), and every report
+  it wrote with `-o` (noted in `reports.sha256` in the cache folder; output redirected with `>` is
+  not noted). Matching is by exact content, never by name or folder: an edited copy is scanned like
+  any other file. Two of these are taken as they are on disk, so whatever sits under those names in
+  the cache folder is trusted: the downloaded rule files (`rules/yara-forge.yar`, `.yarc`, `.json`)
+  and the report list. Every file skipped this way is listed, so none of it is hidden.
+- sums up cloud-only files by folder, so you can see which sync folder they belong to.
 
 ### Community rules (`--update`)
 
 Downloads YARA-Forge's latest release (`--rule-pack core|extended|full`, default `core`), checks it
 compiles, and stores it precompiled in the cache folder (`~/.cache/zscan`, or `$ZSCAN_HOME`). If a
 download is broken, the previous rules stay in place. YARA-Forge `score` maps to severity:
-85+ CRIT, 70+ HIGH, 60+ MED, lower LOW. Use `--no-community` to scan without them. The rules
+85+ CRIT, 70+ HIGH, 60+ MED, lower LOW. Two kinds of rule are capped at MED, because on a Windows PC
+they fired on validly signed software: the Malpedia rules generated by yara-signator (names ending
+in `_Auto`, about a third of `core`), which match code sequences that also occur in shared libraries
+such as OpenSSL or a compiler runtime, and threat-hunting rules (`Hunting` in the name). Use
+`--no-community` to scan without them. The rules
 come from many authors under their own licenses, so they are downloaded, not stored in this repo.
 
-`--update` also tries to save MalwareBazaar's recent SHA-256 list (last 48 hours, CC0) as an
-offline hash list that is checked on every scan.
+`--update` also saves MalwareBazaar's recent SHA-256 list (last 48 hours, CC0) as an offline hash
+list that is checked on every scan. abuse.ch now requires a free Auth-Key for it, so this step runs
+only when `MALWAREBAZAAR_API_KEY` is set (the same key `--intel` uses), and is skipped with a note
+otherwise. The keyed download is written from abuse.ch's documentation and has not yet been tried
+against the live service.
 
 ### Online hash lookups (`--intel`)
 
@@ -164,11 +221,17 @@ default threshold of 0.99 as a provisional guess, and expect that programs unlik
 pip install -e '.[test,ml]' && pytest   # without the ml extra, the ML tests are skipped
 ```
 
-CI runs the suite on Python 3.10 to 3.13. Tests build harmless samples at runtime (the EICAR test
+CI runs the suite on Linux with Python 3.10 to 3.13, and on Windows with Python 3.12. Tests build harmless samples at runtime (the EICAR test
 string, hand-made non-runnable PE and ELF files, scripts with ransomware-style commands, nested and
 booby-trapped archives). Network sources are faked, so tests run offline. No real malware is used
 or stored. A fuzz test feeds each file kind 150 randomly damaged copies to check that nothing
 crashes or hangs.
+
+Before a release, run `python tools/own_history.py` as the last step before committing (with the
+community rules installed). It rewrites `zscan/own-history.sha256` from the git history and the
+working tree, so the new version recognises copies of every earlier one. A checkout where the
+tests have run also holds compiled tests in `tests/__pycache__`; ZScan flags those, since they
+carry the test samples, and they are never shipped.
 
 ## How well does it hold up?
 
@@ -192,6 +255,9 @@ test data, and members over 64 MiB.
 - No rar, 7z or zstd unpacking, no Mach-O structure checks, files over 64 MiB are skipped.
 - The ML check covers ELF, PDF and APK files only (not Windows programs, scripts or Office files) and
   its accuracy through zscan is not yet measured, see "ML check".
-- Heuristics are tuned on one Linux machine. Expect some noise on other kinds of files.
+- Heuristics are tuned on one Linux machine and one Windows PC. Expect some noise on other kinds of
+  files. Windows support is new; the tests run on Windows in CI.
+- No Authenticode check yet: a signed program from a known vendor is judged like any other, so
+  packed or protected commercial software shows up as suspicious.
 - YARA with the community rules is the slow part: roughly 15 files a second per core on system
   binaries (about 50 per core without them).

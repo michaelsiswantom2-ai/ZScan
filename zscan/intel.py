@@ -104,7 +104,7 @@ class OnlineIntel:
         if not self.cache_path or not self.cache_path.exists():
             return {}
         try:
-            data = json.loads(self.cache_path.read_text())
+            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             now = time.time()
             return {k: v for k, v in data.items() if now - v.get("t", 0) < CACHE_TTL}
         except (OSError, ValueError):
@@ -115,7 +115,7 @@ class OnlineIntel:
             return
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_path.write_text(json.dumps(self.cache))
+            self.cache_path.write_text(json.dumps(self.cache), encoding="utf-8")
         except OSError:
             pass
 
@@ -210,21 +210,42 @@ class OnlineIntel:
 
 # ---------------------------------------------------------------- feed update
 
-BAZAAR_RECENT = "https://bazaar.abuse.ch/export/txt/sha256/recent/"
+# MalwareBazaar's recent-samples export (last 48 hours, CC0). It used to be free to fetch without
+# an account at bazaar.abuse.ch/export/txt/sha256/recent/, which now answers 410 Gone; exports need
+# a free abuse.ch Auth-Key, given in the path as on https://bazaar.abuse.ch/export/.
+BAZAAR_RECENT = "https://mb-api.abuse.ch/v2/files/exports/{key}/recent.csv"
+_SHA256_IN_LINE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
 
 
-def update_bazaar_list(http=_http) -> tuple[Path, int]:
+class NoAuthKey(RuntimeError):
+    """An abuse.ch download needs an Auth-Key and none is set."""
+
+
+def abuse_ch_key() -> str | None:
+    return os.environ.get("MALWAREBAZAAR_API_KEY") or os.environ.get("ABUSE_CH_AUTH_KEY")
+
+
+def update_bazaar_list(http=_http, key: str | None = None) -> tuple[Path, int]:
     """Download MalwareBazaar's recent SHA-256 list (last 48 h) into the cache."""
-    code, body = http(BAZAAR_RECENT, timeout=60)
+    key = key or abuse_ch_key()
+    if not key:
+        raise NoAuthKey("MalwareBazaar's hash list needs a free abuse.ch Auth-Key (https://auth.abuse.ch/); "
+                        "set MALWAREBAZAAR_API_KEY to include it")
+    code, body = http(BAZAAR_RECENT.format(key=urllib.parse.quote(key, safe="")), timeout=60)
     if code != 200:
-        raise OSError(f"HTTP {code} from {BAZAAR_RECENT}")
-    hashes = [ln.strip().lower() for ln in body.decode("utf-8", "replace").splitlines()
-              if ln.strip() and not ln.startswith("#") and HASH_RE.match(ln.strip())]
+        raise OSError(f"HTTP {code} from {BAZAAR_RECENT.format(key='<your key>')}")   # never print the key
+    # The CSV has one sample per row with its SHA-256 first among the hashes (MD5, SHA-1, imphash
+    # and TLSH have other lengths), so take the first 64-hex-digit value of each row.
+    hashes = []
+    for ln in body.decode("utf-8", "replace").splitlines():
+        m = None if ln.startswith("#") else _SHA256_IN_LINE.search(ln)
+        if m:
+            hashes.append(m.group(0).lower())
     if not hashes:
         raise ValueError("no hashes in MalwareBazaar response")
     d = cache_dir() / "hashlists"
     d.mkdir(parents=True, exist_ok=True)
     path = d / "malwarebazaar-recent.txt"
     path.write_text("# MalwareBazaar recent SHA-256 (abuse.ch, CC0)\n" +
-                    "".join(f"{h},MalwareBazaar\n" for h in hashes))
+                    "".join(f"{h},MalwareBazaar\n" for h in hashes), encoding="utf-8")
     return path, len(hashes)

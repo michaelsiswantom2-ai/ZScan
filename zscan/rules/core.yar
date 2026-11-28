@@ -19,6 +19,7 @@ rule UPX_Packed
     meta:
         description = "Executable packed with UPX (Windows or Linux)"
         severity = 2
+        group = "packing"    // one trait with zscan's own packer checks; counted once
     strings:
         $upx0 = "UPX0"
         $upx1 = "UPX1"
@@ -49,6 +50,7 @@ rule Process_Injection_API_Strings
     meta:
         description = "Classic remote-thread injection API names present together"
         severity = 3
+        group = "injection"  // the same trait as zscan's import-table check; counted once
     strings:
         $a = "VirtualAllocEx"
         $b = "WriteProcessMemory"

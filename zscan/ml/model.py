@@ -99,7 +99,7 @@ def update_models(kinds=None, fetch=None, directory: Path | None = None) -> dict
         meta = {"kind": kind, "file": name, "url": url, "bytes": len(blob),
                 "sha256": hashlib.sha256(blob).hexdigest(), "trees": booster.num_trees(),
                 "features": booster.num_feature(), "downloaded": time.strftime("%Y-%m-%d %H:%M:%S")}
-        (directory / (name + ".json")).write_text(json.dumps(meta, indent=2))
+        (directory / (name + ".json")).write_text(json.dumps(meta, indent=2), encoding="utf-8")
         out[kind] = meta
     return out
 
@@ -111,7 +111,7 @@ def installed_models(directory: Path | None = None) -> dict:
     for kind, name in MODEL_FILES.items():
         if (directory / name).is_file():
             try:
-                found[kind] = json.loads((directory / (name + ".json")).read_text())
+                found[kind] = json.loads((directory / (name + ".json")).read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 found[kind] = {"kind": kind, "file": name}
     return found

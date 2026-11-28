@@ -22,6 +22,7 @@ class Finding:
     title: str
     severity: int      # 1 = info, 2 = low, 3 = medium, 4 = high, 5 = critical
     detail: str = ""
+    group: str = ""    # findings that describe the same trait; only the strongest one counts
 
 
 @dataclass
@@ -52,7 +53,14 @@ class FileReport:
     @property
     def score(self) -> int:
         weights = {1: 0, 2: 5, 3: 15, 4: 35, 5: 100}
-        return min(100, sum(weights.get(f.severity, 0) for f in self.findings))
+        total, strongest = 0, {}
+        for f in self.findings:
+            w = weights.get(f.severity, 0)
+            if f.group:
+                strongest[f.group] = max(strongest.get(f.group, 0), w)
+            else:
+                total += w
+        return min(100, total + sum(strongest.values()))
 
     @property
     def verdict(self) -> str:
@@ -85,7 +93,6 @@ def shannon_entropy(data: bytes) -> float:
 
 
 MAGIC = [
-    (b"MZ", "pe"),
     (b"\x7fELF", "elf"),
     (b"PK\x03\x04", "zip"),
     (b"%PDF", "pdf"),
@@ -103,6 +110,14 @@ _BZIP2_LEVELS = {bytes([c]) for c in b"123456789"}
 
 
 def detect_type(data: bytes) -> str:
+    if data[:2] == b"MZ":
+        if _has_pe_signature(data):
+            return "pe"
+        if not _looks_like_text(data):
+            # Windows only runs an MZ file as a program if "PE\0\0" follows. The rest are DOS
+            # and 16-bit programs (NE, LE, LX: .fon bitmap fonts, Win16 stubs in SysWOW64),
+            # Windows update deltas and cut-off files. Calling them broken PE files was noise.
+            return "dos"
     for magic, name in MAGIC:
         if data.startswith(magic):
             return name
@@ -110,10 +125,22 @@ def detect_type(data: bytes) -> str:
         return "bzip2"
     if data[257:262] == b"ustar":
         return "tar"
-    sample = data[:4096]
-    if sample and all(32 <= b < 127 or b in (9, 10, 13) for b in sample):
+    if _looks_like_text(data):
         return "text"
     return "data"
+
+
+def _has_pe_signature(data: bytes) -> bool:
+    """The MZ header's e_lfanew field (at 0x3C) points at "PE\0\0", as the Windows loader requires."""
+    if len(data) < 0x40:
+        return False
+    offset = int.from_bytes(data[0x3C:0x40], "little")
+    return data[offset:offset + 4] == b"PE\0\0"
+
+
+def _looks_like_text(data: bytes) -> bool:
+    sample = data[:4096]
+    return bool(sample) and all(32 <= b < 127 or b in (9, 10, 13) for b in sample)
 
 
 # ---------------------------------------------------------------- strings
@@ -144,7 +171,8 @@ SUSPICIOUS_PATTERNS = [
     (rb"stratum\+(?:tcp|ssl)://", "Crypto-miner pool URL", 3),
     (rb"your files (?:have been|are) encrypted", "Ransom note wording", 4),
     (rb"https?://\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?/", "URL with raw IP address", 2),
-    (rb"\b[a-z2-7]{16,56}\.onion\b", "Tor .onion address", 3),
+    # Ad-block filter lists, browser caches and chat apps mention .onion sites all the time.
+    (rb"\b[a-z2-7]{16,56}\.onion\b", "Tor .onion address", 2),
 ]
 CASE_SENSITIVE_PATTERNS = [
     (rb"(?:[A-Za-z0-9+/]{4}){60,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?", "Large base64 blob", 2),
@@ -186,6 +214,17 @@ PACKER_SECTIONS = {"UPX0", "UPX1", "UPX2", ".aspack", ".adata", ".petite", ".nsp
                    ".nsp1", "MPRESS1", "MPRESS2", ".themida", ".vmp0", ".vmp1"}
 
 
+# Packers and protectors (UPX, Themida, VMProtect...) are common in ordinary commercial software,
+# and one packed file shows several signs of it at once: packer section names, high-entropy and
+# writable+executable sections, a stripped import table. They all describe a single trait, so they
+# share this group and count once, at their strongest: a packed file is suspicious, never
+# malicious on that alone.
+PACKING = "packing"
+# The import-table check and the bundled YARA rule Process_Injection_API_Strings see the same
+# API names (they sit in the import table as plain text), so they share a group too.
+INJECTION = "injection"
+
+
 def pe_findings(data: bytes) -> list[Finding]:
     if pefile is None:
         return [Finding("pe", "pefile not installed; PE checks skipped", 1)]
@@ -211,15 +250,17 @@ def _pe_findings(data: bytes) -> list[Finding]:
         writable = bool(chars & 0x80000000)
         executable = bool(chars & 0x20000000)
         if name in PACKER_SECTIONS:
-            out.append(Finding("pe", f"Packer section name '{name}'", 3))
-        if ent > 7.2 and s.SizeOfRawData > 1024:
-            out.append(Finding("pe", f"High-entropy section '{name}'", 3,
-                               f"entropy {ent:.2f} (packed or encrypted code?)"))
+            out.append(Finding("pe", f"Packer section name '{name}'", 3, group=PACKING))
+        # Only code counts: compressed icons in .rsrc, packed data and the compressed debug
+        # sections of MinGW and Go programs ("/19", "/32") are high-entropy in normal programs.
+        if ent > 7.2 and s.SizeOfRawData > 1024 and (executable or chars & 0x20):
+            out.append(Finding("pe", f"High-entropy code section '{name}'", 3,
+                               f"entropy {ent:.2f} (packed or encrypted code?)", group=PACKING))
         if writable and executable:
-            out.append(Finding("pe", f"Section '{name}' is writable and executable", 3))
+            out.append(Finding("pe", f"Section '{name}' is writable and executable", 3, group=PACKING))
         if s.SizeOfRawData == 0 and s.Misc_VirtualSize > 0x10000 and executable:
             out.append(Finding("pe", f"Empty-on-disk executable section '{name}'", 2,
-                               "typical of unpack-at-runtime stubs"))
+                               "typical of unpack-at-runtime stubs", group=PACKING))
 
     # Entry point outside any section, or in the last section
     ep = pe.OPTIONAL_HEADER.AddressOfEntryPoint
@@ -229,7 +270,7 @@ def _pe_findings(data: bytes) -> list[Finding]:
     elif ep_section is not None and pe.sections and ep_section is pe.sections[-1] \
             and len(pe.sections) > 1:
         out.append(Finding("pe", "Entry point in last section", 2,
-                           "common in packed or infected binaries"))
+                           "common in packed or infected binaries", group=PACKING))
 
     # Imports
     imported = set()
@@ -238,7 +279,7 @@ def _pe_findings(data: bytes) -> list[Finding]:
             if imp.name:
                 imported.add(imp.name.decode("latin-1", "replace"))
     if not imported:
-        out.append(Finding("pe", "No import table", 2, "may resolve APIs at runtime"))
+        out.append(Finding("pe", "No import table", 2, "may resolve APIs at runtime", group=PACKING))
     for behaviour, names in SUSPICIOUS_IMPORTS.items():
         hit = sorted(imported & names)
         if len(hit) < 2:
@@ -250,10 +291,12 @@ def _pe_findings(data: bytes) -> list[Finding]:
                 continue
             sev = 2
         elif behaviour == "process injection":
-            sev = 4 if len(hit) >= 3 else 3
+            # Debuggers, game overlays, anti-cheat and accessibility tools import these too.
+            sev = 3 if len(hit) >= 3 else 2
         else:
             sev = 2
-        out.append(Finding("pe", f"Imports suggest {behaviour}", sev, ", ".join(hit)))
+        out.append(Finding("pe", f"Imports suggest {behaviour}", sev, ", ".join(hit),
+                           group=INJECTION if behaviour == "process injection" else ""))
 
     # Timestamp sanity
     ts = pe.FILE_HEADER.TimeDateStamp
