@@ -1,16 +1,21 @@
 """False alarms seen on a real Windows PC, and the checks that keep them away
 without hiding real findings."""
+import hashlib
+import io
 import json
 import os
 import random
+import struct
 import zipfile
 from pathlib import Path
 
 import pytest
 
 import zscan.analysis
+import zscan.scanner as scanner_mod
+from zscan.analysis import detect_type
 from zscan.cli import main
-from zscan.scanner import OWN_FILE, Scanner
+from zscan.scanner import OWN_FILE, OWN_HISTORY, Scanner, reports_registry
 from zscan.yara_engine import DEFAULT_RULES, YaraEngine
 
 from samples import CODE_RX, EICAR, build_pe, make_zip
@@ -118,6 +123,21 @@ def test_an_edited_copy_of_zscans_rules_is_still_scanned(scanner, tmp_path):
     assert rep.verdict == "malicious"
 
 
+def test_the_whole_package_folder_is_recognised(tmp_path, monkeypatch):
+    # Bytecode of another Python version, or a module this run never imported, is ZScan's too.
+    # A file of any other kind dropped into the folder is not.
+    pkg = tmp_path / "zscan"
+    (pkg / "__pycache__").mkdir(parents=True)
+    pyc = pkg / "__pycache__" / "analysis.cpython-399.pyc"
+    pyc.write_bytes(b"\x00\x00\r\n" + b"vssadmin delete shadows /all /quiet")
+    dropped = pkg / "update.exe"
+    dropped.write_bytes(b"MZ" + b"\x00" * 62 + b"wbadmin delete catalog -quiet")
+    monkeypatch.setattr(scanner_mod, "PACKAGE_DIR", pkg)
+    own = scanner_mod.own_file_hashes(None)
+    assert hashlib.sha256(pyc.read_bytes()).hexdigest() in own
+    assert hashlib.sha256(dropped.read_bytes()).hexdigest() not in own
+
+
 def test_downloaded_community_rules_are_recognised(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "rules").mkdir(parents=True)
@@ -134,3 +154,113 @@ def test_own_files_are_recognised_in_parallel_scans(tmp_path, capsys):
     assert main(["--no-community", "--json", "-j", "2", str(tmp_path)]) == 2
     summary = json.loads(capsys.readouterr().out)["summary"]
     assert summary["skipped_reasons"] == {OWN_FILE: 1} and summary["malicious"] == 1
+
+
+# ------------------------------------------------------------ MZ files that are not Windows programs
+
+def mz_header(e_lfanew: int, size: int = 0x40) -> bytearray:
+    head = bytearray(size)
+    head[:2] = b"MZ"
+    struct.pack_into("<I", head, 0x3C, e_lfanew)
+    return head
+
+
+def test_16_bit_programs_and_fonts_are_not_broken_windows_programs(scanner, tmp_path):
+    # Bitmap fonts (.fon) and the Win16 stubs in SysWOW64 are NE files: 913 of them were
+    # reported as "Malformed PE header" on one PC.
+    font = bytes(mz_header(0x80, 0x80)) + b"NE\x05\x01\x94\x00\x02\x00" + bytes(400)
+    rep = scan(scanner, tmp_path, "8514fix.fon", font)
+    assert rep.file_type == "dos" and rep.findings == [] and rep.verdict == "clean"
+    assert detect_type(b"MZ\x90\x00" + bytes(100)) == "dos"                   # a DOS program
+    assert detect_type(bytes(mz_header(0x319A000)) + os.urandom(8000)) == "dos"  # a Windows update delta
+
+
+def test_text_that_starts_with_mz_is_text():
+    assert detect_type(b"MZ,Mozambique,Maputo\nNA,Namibia,Windhoek\n") == "text"
+
+
+def test_a_real_windows_program_is_still_one():
+    from samples import benign_pe
+    assert detect_type(benign_pe()) == "pe"
+
+
+# ------------------------------------------------------------ game packs with "\\" in local headers
+
+def zip_with_local_name(central: str, local: str) -> bytes:
+    data = bytearray(make_zip({central: b"r_shadows = 1\n" * 50}))
+    i = data.index(b"PK\x03\x04")
+    n = struct.unpack_from("<H", data, i + 26)[0]
+    assert n == len(local)
+    data[i + 30:i + 30 + n] = local.encode()
+    return bytes(data)
+
+
+def test_backslashes_in_local_headers_are_read(scanner, tmp_path):
+    # CryEngine paks write "Config\\a.cfg" in the local header and "Config/a.cfg" in the directory.
+    rep = scan(scanner, tmp_path, "engine.pak", zip_with_local_name("Config/a.cfg", "Config\\a.cfg"))
+    assert [c.path.split("!")[-1] for c in rep.children] == ["Config/a.cfg"]
+    assert not rep.partly_scanned
+
+
+def test_other_name_mismatches_are_still_refused(scanner, tmp_path):
+    rep = scan(scanner, tmp_path, "odd.zip", zip_with_local_name("Config/a.cfg", "Config/b.cfg"))
+    assert rep.children == [] and rep.partly_scanned
+    assert "differ" in " ".join(rep.unscanned)
+
+
+# ------------------------------------------------------------ ZScan's history and its reports
+
+def test_the_shipped_history_list_is_well_formed():
+    rows = [ln.split()[0] for ln in OWN_HISTORY.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.startswith("#")]
+    assert len(rows) >= 10
+    assert all(len(r) == 64 and int(r, 16) >= 0 for r in rows)
+
+
+def test_files_from_older_versions_are_recognised(tmp_path, monkeypatch):
+    old_rules = b'rule Old { strings: $a = "vssadmin delete shadows" $b = "wbadmin delete catalog" condition: all of them }'
+    history = tmp_path / "own-history.sha256"
+    history.write_text(f"# test\n{hashlib.sha256(old_rules).hexdigest()}  zscan/rules/core.yar @ 0000000\n")
+    monkeypatch.setattr(scanner_mod, "OWN_HISTORY", history)
+    s = Scanner(YaraEngine(community=False))
+    rep = scan(s, tmp_path, "zscan-0.4.0-py3-none-any.whl", make_zip({"zscan/rules/core.yar": old_rules}))
+    assert [c.skipped for c in rep.children] == [OWN_FILE] and rep.verdict == "clean"
+
+
+def test_reports_are_recognised_in_later_scans(tmp_path, capsys):
+    # A report quotes what it found, so on its own it looks like what it describes.
+    target = tmp_path / "files"
+    target.mkdir()
+    (target / "cleanup.bat").write_bytes(b"vssadmin delete shadows /all /quiet & wbadmin delete catalog -quiet\r\n")
+    report = tmp_path / "reports" / "scan.txt"
+    report.parent.mkdir()
+    assert main(["--no-community", "-v", "-o", str(report), str(target)]) == 2
+    assert reports_registry().is_file()
+    edited = tmp_path / "reports" / "edited.txt"
+    edited.write_bytes(report.read_bytes() + b"\nnotes\n")
+    capsys.readouterr()
+
+    main(["--no-community", "--json", str(tmp_path / "reports")])
+    data = json.loads(capsys.readouterr().out)
+    assert data["own_files"] == [str(report)]                    # the report, recognised
+    verdicts = {f["path"]: f["verdict"] for f in data["files"]}
+    assert verdicts[str(edited)] in ("suspicious", "malicious")  # an edited copy is scanned as usual
+
+    main(["--no-community", "-q", "--no-color", str(tmp_path / "reports")])
+    out = capsys.readouterr().out
+    assert "Skipped as ZScan's own files (1), recognised by exact content:" in out and str(report) in out
+
+
+# ------------------------------------------------------------ where cloud-only files are
+
+def test_cloud_only_files_are_summed_up_by_folder(tmp_path, monkeypatch, capsys):
+    for rel in ("Sync/Photos/2024/a.jpg", "Sync/Photos/2024/b.jpg", "Sync/Docs/c.docx"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+    monkeypatch.setattr(scanner_mod, "not_local", lambda st: True)
+    main(["--no-community", "--json", str(tmp_path)])
+    folders = json.loads(capsys.readouterr().out)["cloud_only_folders"]
+    assert sum(folders.values()) == 3 and len(folders) >= 1
+    main(["--no-community", "-q", "--no-color", str(tmp_path)])
+    assert "Cloud-only files (not downloaded, so not scanned), by folder:" in capsys.readouterr().out

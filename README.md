@@ -16,7 +16,7 @@ opened in memory, never extracted to disk.
 | Bundled YARA | Starter rules in `zscan/rules/` (EICAR, UPX packing for Windows and Linux files, ransomware recovery-blocking commands, injection API strings, Office auto-exec macros, PHP webshells), or your own with `-r` |
 | Threat intel | Offline known-bad hash lists (`--hashlist`, plus the MalwareBazaar list from `--update`). With `--intel`: CIRCL hashlookup (known-good files), MalwareBazaar and VirusTotal. Only hashes are sent, never file contents. |
 | Entropy | Whole-file and per-section Shannon entropy (packed or encrypted content). Per section only for code: compressed icons and debug data are random-looking in normal programs too |
-| PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays |
+| PE heuristics (Windows) | Packer section names, writable+executable sections, entry point outside or in the last section, missing imports, import combos that suggest injection, keylogging, anti-debugging or privilege tweaks, bad timestamps, overlays. Only files whose MZ header points at a PE header count as Windows programs; DOS and 16-bit programs (`.fon` bitmap fonts, the Win16 stubs in SysWOW64) are typed `dos` and left alone |
 | ELF heuristics (Linux) | Writable+executable segments, entry point outside the executable segments, missing or out-of-file section table, high-entropy code sections, weak import hints (reverse-shell shape, `ptrace`). Uses a small built-in ELF reader (32/64-bit, both byte orders). |
 | ML check (opt-in, `--ml`) | ELF, PDF and APK files are scored by machine-learning models trained on the public EMBER2024 data: how much does this file look like malware rather than like benign programs? Meant for files no rule knows yet. A statistical hint, never a verdict on its own (see "ML check" below). |
 | Suspicious strings | Encoded PowerShell and download cradles, shadow-copy deletion, Run-key persistence, reverse shells, pipe-to-shell (stronger when aimed at a raw IP), crypto-miner pool URLs, ransom-note text, raw-IP URLs, .onion addresses, big base64 blobs. Everyday mentions (docs, install instructions) are only weak hints, and string hits count one level lower inside compiled binaries. Compressed or encrypted content is skipped, because short patterns match random bytes by chance. |
@@ -109,19 +109,30 @@ line every 30 seconds. On a whole drive zscan also:
   else was found, that makes the exit code 3.
 - keeps going when a file name cannot be shown on the console (Thai names on an English Windows
   code page, say): those characters are printed as escapes.
-- recognises its own files (the code that is running, the YARA rule files it loaded, the downloaded
-  community rules) and copies of them, for example inside a pip-cached wheel, and lists them as
-  skipped, "ZScan's own file". Rule files are full of the very strings they look for. Matching is
-  by exact content, never by name or folder: an edited copy is scanned like any other file. The
-  three downloaded files in the cache folder (`rules/yara-forge.yar`, `.yarc`, `.json`) are taken as
-  they are on disk, so whatever sits under those names in the cache folder is skipped.
+- recognises its own files and copies of them, for example inside a pip-cached wheel, and lists
+  them as skipped, "ZScan's own file", under "Skipped as ZScan's own files" (`own_files` in JSON).
+  Rule files are full of the very strings they look for, and reports quote what they found, so
+  scanning them only raises alarms about ZScan itself. It knows: its own package folder (the code,
+  including bytecode for any Python version, its rules and lists; any other kind of file there is
+  scanned), the YARA rule files it loaded, the downloaded community rules, every file from its own history that it
+  would flag (`zscan/own-history.sha256`, so copies of older versions count too), and every report
+  it wrote with `-o` (noted in `reports.sha256` in the cache folder; output redirected with `>` is
+  not noted). Matching is by exact content, never by name or folder: an edited copy is scanned like
+  any other file. Two of these are taken as they are on disk, so whatever sits under those names in
+  the cache folder is trusted: the downloaded rule files (`rules/yara-forge.yar`, `.yarc`, `.json`)
+  and the report list. Every file skipped this way is listed, so none of it is hidden.
+- sums up cloud-only files by folder, so you can see which sync folder they belong to.
 
 ### Community rules (`--update`)
 
 Downloads YARA-Forge's latest release (`--rule-pack core|extended|full`, default `core`), checks it
 compiles, and stores it precompiled in the cache folder (`~/.cache/zscan`, or `$ZSCAN_HOME`). If a
 download is broken, the previous rules stay in place. YARA-Forge `score` maps to severity:
-85+ CRIT, 70+ HIGH, 60+ MED, lower LOW. Use `--no-community` to scan without them. The rules
+85+ CRIT, 70+ HIGH, 60+ MED, lower LOW. Two kinds of rule are capped at MED, because on a Windows PC
+they fired on validly signed software: the Malpedia rules generated by yara-signator (names ending
+in `_Auto`, about a third of `core`), which match code sequences that also occur in shared libraries
+such as OpenSSL or a compiler runtime, and threat-hunting rules (`Hunting` in the name). Use
+`--no-community` to scan without them. The rules
 come from many authors under their own licenses, so they are downloaded, not stored in this repo.
 
 `--update` also saves MalwareBazaar's recent SHA-256 list (last 48 hours, CC0) as an offline hash
@@ -212,6 +223,12 @@ string, hand-made non-runnable PE and ELF files, scripts with ransomware-style c
 booby-trapped archives). Network sources are faked, so tests run offline. No real malware is used
 or stored. A fuzz test feeds each file kind 150 randomly damaged copies to check that nothing
 crashes or hangs.
+
+Before a release, run `python tools/own_history.py` as the last step before committing (with the
+community rules installed). It rewrites `zscan/own-history.sha256` from the git history and the
+working tree, so the new version recognises copies of every earlier one. A checkout where the
+tests have run also holds compiled tests in `tests/__pycache__`; ZScan flags those, since they
+carry the test samples, and they are never shipped.
 
 ## How well does it hold up?
 

@@ -9,6 +9,7 @@ import bz2
 import gzip
 import io
 import lzma
+import struct
 import tarfile
 import warnings
 import zipfile
@@ -100,6 +101,7 @@ def _zip_members(data: bytes, budget: Budget) -> Iterator[Member]:
         if not budget.take(size):
             yield Member(info.filename, note="archive size budget used up, skipped")
             continue
+        _accept_separator_spelling(data, info)
         try:
             # Read at most the declared size + 1 so a lying header cannot blow up memory.
             with warnings.catch_warnings():
@@ -112,6 +114,23 @@ def _zip_members(data: bytes, budget: Budget) -> Iterator[Member]:
             yield Member(info.filename, body)
         except Exception as e:  # noqa: BLE001 - zlib.error, BadZipFile, lzma/bz2 errors, ...
             yield Member(info.filename, note=f"unreadable: {type(e).__name__}: {e}")
+
+
+def _accept_separator_spelling(data: bytes, info) -> None:
+    """Some tools (CryEngine game packs, for one) write a member's name with "\\" in its local
+    header and "/" in the central directory. zipfile refuses such a member because the names
+    differ. They name the same file, so read it under the header's spelling. Any other
+    difference is left for zipfile to refuse."""
+    off = info.header_offset
+    if data[off:off + 4] != b"PK\x03\x04" or len(data) < off + 30:
+        return
+    (length,) = struct.unpack_from("<H", data, off + 26)
+    try:
+        local = data[off + 30:off + 30 + length].decode("utf-8" if info.flag_bits & 0x800 else "cp437")
+    except UnicodeDecodeError:
+        return
+    if local != info.orig_filename and local.replace("\\", "/") == info.orig_filename.replace("\\", "/"):
+        info.orig_filename = local
 
 
 def _zip_overlap(infos) -> str:

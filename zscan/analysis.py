@@ -93,7 +93,6 @@ def shannon_entropy(data: bytes) -> float:
 
 
 MAGIC = [
-    (b"MZ", "pe"),
     (b"\x7fELF", "elf"),
     (b"PK\x03\x04", "zip"),
     (b"%PDF", "pdf"),
@@ -111,6 +110,14 @@ _BZIP2_LEVELS = {bytes([c]) for c in b"123456789"}
 
 
 def detect_type(data: bytes) -> str:
+    if data[:2] == b"MZ":
+        if _has_pe_signature(data):
+            return "pe"
+        if not _looks_like_text(data):
+            # Windows only runs an MZ file as a program if "PE\0\0" follows. The rest are DOS
+            # and 16-bit programs (NE, LE, LX: .fon bitmap fonts, Win16 stubs in SysWOW64),
+            # Windows update deltas and cut-off files. Calling them broken PE files was noise.
+            return "dos"
     for magic, name in MAGIC:
         if data.startswith(magic):
             return name
@@ -118,10 +125,22 @@ def detect_type(data: bytes) -> str:
         return "bzip2"
     if data[257:262] == b"ustar":
         return "tar"
-    sample = data[:4096]
-    if sample and all(32 <= b < 127 or b in (9, 10, 13) for b in sample):
+    if _looks_like_text(data):
         return "text"
     return "data"
+
+
+def _has_pe_signature(data: bytes) -> bool:
+    """The MZ header's e_lfanew field (at 0x3C) points at "PE\0\0", as the Windows loader requires."""
+    if len(data) < 0x40:
+        return False
+    offset = int.from_bytes(data[0x3C:0x40], "little")
+    return data[offset:offset + 4] == b"PE\0\0"
+
+
+def _looks_like_text(data: bytes) -> bool:
+    sample = data[:4096]
+    return bool(sample) and all(32 <= b < 127 or b in (9, 10, 13) for b in sample)
 
 
 # ---------------------------------------------------------------- strings
@@ -152,7 +171,8 @@ SUSPICIOUS_PATTERNS = [
     (rb"stratum\+(?:tcp|ssl)://", "Crypto-miner pool URL", 3),
     (rb"your files (?:have been|are) encrypted", "Ransom note wording", 4),
     (rb"https?://\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?/", "URL with raw IP address", 2),
-    (rb"\b[a-z2-7]{16,56}\.onion\b", "Tor .onion address", 3),
+    # Ad-block filter lists, browser caches and chat apps mention .onion sites all the time.
+    (rb"\b[a-z2-7]{16,56}\.onion\b", "Tor .onion address", 2),
 ]
 CASE_SENSITIVE_PATTERNS = [
     (rb"(?:[A-Za-z0-9+/]{4}){60,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?", "Large base64 blob", 2),

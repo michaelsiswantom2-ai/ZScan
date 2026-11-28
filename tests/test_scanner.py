@@ -87,7 +87,12 @@ def test_findings_of_one_group_count_once():
 
 
 def test_truncated_pe(scanner, tmp_path):
-    rep = scanner.scan_file(write(tmp_path, "broken.exe", b"MZ" + b"\x00" * 10))
+    # The MZ header points at "PE\0\0", so Windows would try to load it, but the rest is missing.
+    header = bytearray(0x40)
+    header[:2] = b"MZ"
+    header[0x3C] = 0x40
+    rep = scanner.scan_file(write(tmp_path, "broken.exe", bytes(header) + b"PE\0\0"))
+    assert rep.file_type == "pe"
     assert "Malformed PE header" in titles(rep)
 
 

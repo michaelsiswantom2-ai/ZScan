@@ -13,7 +13,7 @@ from pathlib import Path
 from . import __version__, intel
 from .config import cache_dir
 from .ml.model import DEFAULT_THRESHOLD, MODEL_LABELS, MlScorer, MlUnavailable, update_models
-from .scanner import CRASHED, Scanner, WorkerCrashed
+from .scanner import CLOUD_ONLY, CRASHED, OWN_FILE, Scanner, WorkerCrashed, remember_report
 from .yara_engine import FORGE_PACKS, YaraEngine, update_community
 
 SEV_LABEL = {1: "INFO", 2: "LOW", 3: "MED", 4: "HIGH", 5: "CRIT"}
@@ -199,6 +199,7 @@ def main(argv=None) -> int:
     finally:
         if out is not sys.stdout:
             out.close()
+            remember_report(a.output)    # it quotes findings, so later scans would flag it
 
 
 def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int:
@@ -209,6 +210,8 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
     skipped_why: Counter = Counter()
     unreadable: list = []       # folders that could not be opened, so their files went unscanned
     crashed: list = []          # files that crashed a scan worker, so they went unscanned
+    own: list = []              # skipped as ZScan's own files: listed, so nothing hides there unseen
+    cloud: Counter = Counter()  # cloud-only files per folder
     stopped = None              # why the scan ended early, if it did
     jobs = (os.cpu_count() or 1) if a.jobs == 0 else max(1, a.jobs)
     if len(paths) == 1 and paths[0].is_file():
@@ -234,6 +237,10 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
                 skipped_why[rep.skipped] += 1
             if rep.error == CRASHED:
                 crashed.append(rep.path)
+            elif rep.skipped == OWN_FILE:
+                own.append(rep.path)
+            elif rep.skipped == CLOUD_ONLY:
+                cloud[_top_folder(rep.path)] += 1
             if a.progress and time.monotonic() - last >= PROGRESS_EVERY:
                 last = time.monotonic()
                 print(f"progress: {sum(counts.values()):,} files in {_minutes(last - started)} "
@@ -265,7 +272,8 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
         summary = dict(counts, partly_scanned=partial, skipped_reasons=dict(skipped_why),
                        unreadable_folders=len(unreadable), crashed=len(crashed), stopped_early=stopped)
         json.dump({"summary": summary, "files": [to_dict(r) for r in reports],
-                   "unreadable_folders": unreadable, "crashed_files": crashed}, out, indent=2)
+                   "unreadable_folders": unreadable, "crashed_files": crashed, "own_files": own,
+                   "cloud_only_folders": dict(cloud.most_common())}, out, indent=2)
         print(file=out)
     else:
         if unreadable:
@@ -280,6 +288,18 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
             print(f"\nFiles that crashed a scan worker ({len(crashed)}), so they were not scanned:", file=out)
             for path in crashed:
                 print(f"    {path}", file=out)
+        if own:
+            print(f"\nSkipped as ZScan's own files ({len(own)}), recognised by exact content:", file=out)
+            for path in own[:20]:
+                print(f"    {path}", file=out)
+            if len(own) > 20:
+                print(f"    ... and {len(own) - 20} more", file=out)
+        if cloud:
+            print("\nCloud-only files (not downloaded, so not scanned), by folder:", file=out)
+            for folder, n in cloud.most_common(10):
+                print(f"    {folder} ({n:,})", file=out)
+            if len(cloud) > 10:
+                print(f"    ... and {len(cloud) - 10} more folders", file=out)
         if stopped:
             print(f"\nNOTE: {stopped}. Files after the last one listed were not scanned.", file=out)
         total = sum(counts.values())
@@ -304,6 +324,12 @@ def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int
     if counts["suspicious"]:
         return 1
     return 3 if counts["error"] or unreadable else 0
+
+
+def _top_folder(path: str, depth: int = 4) -> str:
+    """The first few levels of a file's folder, e.g. C:\\Users\\name\\OneDrive."""
+    parts = Path(path).parent.parts
+    return str(Path(*parts[:depth])) if parts else path
 
 
 def _minutes(seconds: float) -> str:

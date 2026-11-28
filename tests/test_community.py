@@ -62,3 +62,16 @@ def test_not_a_zip():
 @pytest.mark.parametrize("score,sev", [(95, 5), (85, 5), (75, 4), (65, 3), (40, 2), (None, 3)])
 def test_forge_severity(score, sev):
     assert yara_engine.forge_severity(score) == sev
+
+
+@pytest.mark.parametrize("rule,score,sev", [
+    ("MALPEDIA_Win_Redpepper_Auto", 75, 3),        # code-similarity rule: fired on OpenSSL
+    ("MALPEDIA_Win_Yokai_Auto", 75, 3),            # ... and on Microsoft's ucrtbased.dll
+    ("SIGNATURE_BASE_Brooxml_Hunting", 70, 3),     # a hunting rule, on a browser cache file
+    ("SIGNATURE_BASE_APT_MAL_LUA_Hunting_SKIPJACK_1", 90, 3),
+    ("MALPEDIA_Win_Example_Auto", 40, 2),          # never raised, only capped
+    ("CAPE_Risepro", 75, 4),                       # ordinary family rules keep their weight
+    ("SIGNATURE_BASE_Mimikatz_Strings", 90, 5),
+])
+def test_noisy_kinds_of_community_rule_are_capped_at_med(rule, score, sev):
+    assert yara_engine.forge_severity(score, rule) == sev
