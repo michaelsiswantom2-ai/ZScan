@@ -1,9 +1,11 @@
 """A file that crashes a scan worker (say, a bug in a native library) must not end a
 whole-drive scan: that file is named, everything else is still scanned."""
 import json
+from concurrent.futures.process import BrokenProcessPool
 
 import pytest
 
+import zscan.scanner as scanner_mod
 from zscan.cli import main
 from zscan.scanner import CRASHED, Scanner, WorkerCrashed
 from zscan.yara_engine import YaraEngine
@@ -55,3 +57,34 @@ def test_workers_that_always_crash_stop_the_scan_with_exit_code_4(tree, monkeypa
     captured = capsys.readouterr()
     assert "the scan stopped early" in captured.err
     assert "STOPPED EARLY" in captured.out
+
+
+def test_a_pool_that_breaks_while_work_is_handed_out(tree, monkeypatch):
+    # A worker can die between two hand-outs, so the next one fails at once (seen in CI).
+    real_new_pool, made = scanner_mod._new_pool, []
+
+    class BreaksOnSecondHandOut:
+        def __init__(self, pool):
+            self.pool, self.calls = pool, 0
+
+        def submit(self, *args):
+            self.calls += 1
+            if self.calls == 2:
+                raise BrokenProcessPool("a child process terminated abruptly")
+            return self.pool.submit(*args)
+
+        def shutdown(self, **kw):
+            self.pool.shutdown(**kw)
+
+    def new_pool(jobs, config):
+        pool = real_new_pool(jobs, config)
+        made.append(pool)
+        return BreaksOnSecondHandOut(pool) if len(made) == 1 else pool
+
+    monkeypatch.setattr(scanner_mod, "_new_pool", new_pool)
+    s = Scanner(YaraEngine(community=False))
+    paths = list(s.iter_paths(tree))
+    reports = list(s.scan_many(paths, jobs=2))
+    assert [r.path for r in reports] == [str(p) for p in paths]
+    assert not [r for r in reports if r.error]         # nothing crashed, so nothing is blamed
+    assert len(made) >= 2                               # it carried on with a new pool

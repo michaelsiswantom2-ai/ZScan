@@ -300,28 +300,32 @@ class Scanner:
         exhausted = False
         try:
             while True:
+                lost = []        # (position, path) whose worker died, or that never reached one
                 # Keep every worker busy. Only unfinished work is capped, so one slow
                 # file at the front cannot stall the rest; finished reports are small.
-                while not exhausted and len(in_flight) < jobs * 4:
+                while not exhausted and not lost and len(in_flight) < jobs * 4:
                     try:
                         path = next(source)
                     except StopIteration:
                         exhausted = True
                         break
-                    in_flight[pool.submit(_worker_scan, str(path))] = (submitted, path)
-                    submitted += 1
-                if not in_flight:
-                    break
-                done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
-                lost = []
-                for future in done:
-                    pos, path = in_flight.pop(future)
                     try:
-                        ready[pos] = future.result()
-                    except BrokenProcessPool:
-                        lost.append((pos, path))
-                    except Exception as e:  # noqa: BLE001 - e.g. a result that could not be sent back
-                        ready[pos] = _failed(path, f"internal error: {type(e).__name__}: {e}")
+                        in_flight[pool.submit(_worker_scan, str(path))] = (submitted, path)
+                    except BrokenProcessPool:       # a worker died since the last check
+                        lost.append((submitted, path))
+                    submitted += 1
+                if not in_flight and not lost:
+                    break
+                if not lost:
+                    done, _ = wait(set(in_flight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        pos, path = in_flight.pop(future)
+                        try:
+                            ready[pos] = future.result()
+                        except BrokenProcessPool:
+                            lost.append((pos, path))
+                        except Exception as e:  # noqa: BLE001 - e.g. a result that could not be sent back
+                            ready[pos] = _failed(path, f"internal error: {type(e).__name__}: {e}")
                 if lost:
                     # A worker died, most likely because a native library (YARA, a decompressor)
                     # crashed on some file, and it took the whole pool with it. Keep whatever
@@ -367,25 +371,45 @@ def _new_pool(jobs: int, config: dict) -> ProcessPoolExecutor:
 
 
 def _isolate(items: list, config: dict) -> Iterator[tuple]:
-    """Scan each (position, path) on its own in a one-worker pool. A file whose worker dies is
-    reported as an error and the pool is replaced. If a fresh worker cannot even scan a few
-    harmless bytes, the workers themselves are broken rather than any file: give up."""
+    """Scan each (position, path) on its own in a one-worker pool, to find the file that kills
+    its worker. A file is blamed only if it does so twice in a row (a crash can have other
+    causes, such as running out of memory) and a fresh worker then still scans a few harmless
+    bytes. If even that fails, the workers themselves are broken, not any file: give up."""
     pool = None
-    try:
-        for pos, path in items:
+
+    def attempt(path) -> FileReport | None:
+        """The file's report, or None if its worker died."""
+        nonlocal pool
+        for _ in range(2):      # a pool that died while idle is not this file's doing: replace it
             if pool is None:
                 pool = _new_pool(1, config)
             try:
-                rep = pool.submit(_worker_scan, str(path)).result()
+                future = pool.submit(_worker_scan, str(path))
+                break
             except BrokenProcessPool:
                 pool.shutdown(wait=True, cancel_futures=True)
                 pool = None
+        else:
+            raise WorkerCrashed("scan workers die as soon as they start, so the scan cannot go on")
+        try:
+            return future.result()
+        except BrokenProcessPool:
+            pool.shutdown(wait=True, cancel_futures=True)
+            pool = None
+            return None
+        except Exception as e:  # noqa: BLE001
+            return _failed(path, f"internal error: {type(e).__name__}: {e}")
+
+    try:
+        for pos, path in items:
+            rep = attempt(path)
+            if rep is None:
+                rep = attempt(path)
+            if rep is None:
                 if not _workers_start(config):
                     raise WorkerCrashed("scan workers crash even on a harmless test input, so the "
-                                        "problem is not one file; try --jobs 1") from None
+                                        "problem is not one file; try --jobs 1")
                 rep = _failed(path, CRASHED)
-            except Exception as e:  # noqa: BLE001
-                rep = _failed(path, f"internal error: {type(e).__name__}: {e}")
             yield pos, rep
     finally:
         if pool is not None:
