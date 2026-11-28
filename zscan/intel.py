@@ -104,7 +104,7 @@ class OnlineIntel:
         if not self.cache_path or not self.cache_path.exists():
             return {}
         try:
-            data = json.loads(self.cache_path.read_text())
+            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             now = time.time()
             return {k: v for k, v in data.items() if now - v.get("t", 0) < CACHE_TTL}
         except (OSError, ValueError):
@@ -115,7 +115,7 @@ class OnlineIntel:
             return
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_path.write_text(json.dumps(self.cache))
+            self.cache_path.write_text(json.dumps(self.cache), encoding="utf-8")
         except OSError:
             pass
 
@@ -226,5 +226,5 @@ def update_bazaar_list(http=_http) -> tuple[Path, int]:
     d.mkdir(parents=True, exist_ok=True)
     path = d / "malwarebazaar-recent.txt"
     path.write_text("# MalwareBazaar recent SHA-256 (abuse.ch, CC0)\n" +
-                    "".join(f"{h},MalwareBazaar\n" for h in hashes))
+                    "".join(f"{h},MalwareBazaar\n" for h in hashes), encoding="utf-8")
     return path, len(hashes)

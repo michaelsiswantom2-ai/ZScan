@@ -84,7 +84,7 @@ class YaraEngine:
             self.community = yara.load(str(compiled))
             info = compiled.with_suffix(".json")
             if info.exists():
-                self.community_info = json.loads(info.read_text())
+                self.community_info = json.loads(info.read_text(encoding="utf-8"))
         except (yara.Error, OSError, ValueError) as e:
             self.error = f"community rules unreadable ({e}); run zscan --update"
 
@@ -154,7 +154,7 @@ def update_community(pack: str = "core", fetch=None) -> dict:
     tmp = d / "yara-forge.yarc.tmp"
     rules.save(str(tmp))
     tmp.replace(d / "yara-forge.yarc")
-    (d / "yara-forge.yar").write_text(source)  # kept for reading / grepping
+    (d / "yara-forge.yar").write_text(source, encoding="utf-8")  # kept for reading / grepping
 
     header = source[:2000]
     meta = {
@@ -165,7 +165,7 @@ def update_community(pack: str = "core", fetch=None) -> dict:
         "downloaded": time.strftime("%Y-%m-%d %H:%M:%S"),
         "url": url,
     }
-    (d / "yara-forge.json").write_text(json.dumps(meta, indent=2))
+    (d / "yara-forge.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
 
 

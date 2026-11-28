@@ -76,6 +76,27 @@ in the main process, so online lookups keep their rate limits. On 4 cores a scan
 community rules loaded went from 51 s to 16 s. If a worker crashes zscan stops with a clear error
 (exit 3); rerun with `-j 1` to find the file.
 
+### Scanning a whole computer
+
+```bash
+zscan -q -j 0 --progress -o C:\zscan-report.txt C:\       # Windows, one drive at a time
+zscan -q -j 0 --progress -o ~/zscan-report.txt /home /usr /opt /etc /var    # Linux
+```
+
+`-o FILE` writes the report as UTF-8, so file names in any language come through, and leaves the
+report itself out of the scan. The summary line still appears on screen. `--progress` prints a
+line every 30 seconds. On a whole drive zscan also:
+
+- skips Windows cloud-only files (OneDrive "online-only" files and similar) instead of reading
+  them, because reading one makes Windows download it. They are counted as skipped, "cloud-only".
+- does not follow folder links (symlinks, and directory junctions on Windows), so nothing is
+  scanned twice and a link loop cannot trap it.
+- lists every folder it could not open, for example system folders that need administrator
+  rights, under "Folders that could not be opened" instead of leaving them out quietly. If nothing
+  else was found, that makes the exit code 3.
+- keeps going when a file name cannot be shown on the console (Thai names on an English Windows
+  code page, say): those characters are printed as escapes.
+
 ### Community rules (`--update`)
 
 Downloads YARA-Forge's latest release (`--rule-pack core|extended|full`, default `core`), checks it
@@ -164,7 +185,7 @@ default threshold of 0.99 as a provisional guess, and expect that programs unlik
 pip install -e '.[test,ml]' && pytest   # without the ml extra, the ML tests are skipped
 ```
 
-CI runs the suite on Python 3.10 to 3.13. Tests build harmless samples at runtime (the EICAR test
+CI runs the suite on Linux with Python 3.10 to 3.13, and on Windows with Python 3.12. Tests build harmless samples at runtime (the EICAR test
 string, hand-made non-runnable PE and ELF files, scripts with ransomware-style commands, nested and
 booby-trapped archives). Network sources are faked, so tests run offline. No real malware is used
 or stored. A fuzz test feeds each file kind 150 randomly damaged copies to check that nothing
@@ -192,6 +213,8 @@ test data, and members over 64 MiB.
 - No rar, 7z or zstd unpacking, no Mach-O structure checks, files over 64 MiB are skipped.
 - The ML check covers ELF, PDF and APK files only (not Windows programs, scripts or Office files) and
   its accuracy through zscan is not yet measured, see "ML check".
-- Heuristics are tuned on one Linux machine. Expect some noise on other kinds of files.
+- Heuristics are tuned on one Linux machine. Expect some noise on other kinds of files. Windows
+  support is new: the tests run on Windows in CI, but zscan has not yet been checked against a whole
+  Windows PC.
 - YARA with the community rules is the slow part: roughly 15 files a second per core on system
   binaries (about 50 per core without them).

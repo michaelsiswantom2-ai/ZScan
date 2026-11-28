@@ -43,7 +43,7 @@ def iter_rows(path: Path) -> Iterator[dict]:
     path = Path(path)
     if path.is_dir():
         for p in sorted(path.rglob("*.jsonl")):
-            with p.open() as f:
+            with p.open(encoding="utf-8") as f:
                 for line in f:
                     yield json.loads(line)
         return

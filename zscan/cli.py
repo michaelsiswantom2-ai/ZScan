@@ -5,6 +5,8 @@ import argparse
 import json
 import os
 import sys
+import time
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from .yara_engine import FORGE_PACKS, YaraEngine, update_community
 SEV_LABEL = {1: "INFO", 2: "LOW", 3: "MED", 4: "HIGH", 5: "CRIT"}
 COLORS = {"clean": "\033[32m", "suspicious": "\033[33m", "malicious": "\033[31m", "error": "\033[35m", "skipped": "\033[90m"}
 RESET = "\033[0m"
+PROGRESS_EVERY = 30.0       # seconds between --progress lines
 
 
 def render_text(rep, verbose: bool, color: bool) -> str:
@@ -124,9 +127,14 @@ def main(argv=None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true", help="show details for clean files too")
     ap.add_argument("-q", "--quiet", action="store_true", help="only print non-clean files")
     ap.add_argument("--max-size", type=int, default=64, help="skip files larger than N MiB (default 64)")
+    ap.add_argument("-o", "--output", type=Path, metavar="FILE",
+                    help="write the report to FILE (UTF-8) instead of the screen; the summary is shown too")
+    ap.add_argument("--progress", action="store_true",
+                    help=f"print a progress line to stderr every {PROGRESS_EVERY:g} seconds (for long scans)")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--version", action="version", version=f"zscan {__version__}")
     a = ap.parse_args(argv)
+    _never_fail_on_odd_names()
 
     code = 0
     if a.update:
@@ -168,30 +176,63 @@ def main(argv=None) -> int:
 
     scanner = Scanner(engine, max_bytes=a.max_size * 1024 * 1024, unpack=not a.no_unpack,
                       hash_list=hash_list, online=online, ml=scorer)
-    color = sys.stdout.isatty() and not a.no_color
 
-    reports = []
-    partial = 0
-    counts = {"clean": 0, "suspicious": 0, "malicious": 0, "skipped": 0, "error": 0}
-    paths = []
+    paths, missing = [], 0
     for target in a.paths:
         if not target.exists():
             print(f"error: {target} does not exist", file=sys.stderr)
-            counts["error"] += 1
+            missing += 1
         else:
             paths.append(target)
+
+    out = sys.stdout
+    if a.output:
+        try:
+            out = open(a.output, "w", encoding="utf-8", errors="backslashreplace")
+        except OSError as e:
+            print(f"error: cannot write {a.output}: {e.strerror or e}", file=sys.stderr)
+            return 3
+    try:
+        return _scan_and_report(a, scanner, paths, missing, out)
+    finally:
+        if out is not sys.stdout:
+            out.close()
+
+
+def _scan_and_report(a, scanner: Scanner, paths: list, missing: int, out) -> int:
+    color = out.isatty() and not a.no_color
+    reports = []
+    partial = 0
+    counts = {"clean": 0, "suspicious": 0, "malicious": 0, "skipped": 0, "error": missing}
+    skipped_why: Counter = Counter()
+    unreadable: list = []       # folders that could not be opened, so their files went unscanned
     jobs = (os.cpu_count() or 1) if a.jobs == 0 else max(1, a.jobs)
     if len(paths) == 1 and paths[0].is_file():
         jobs = 1    # starting workers for a single file only slows it down
+    # Don't scan the report while writing it.
+    report_path = os.path.normcase(os.path.abspath(a.output)) if a.output else None
+
+    def note_unreadable(e: OSError) -> None:
+        unreadable.append(f"{e.filename}: {e.strerror or e}")
 
     def all_files():
         for target in paths:
-            yield from scanner.iter_paths(target)
+            for p in scanner.iter_paths(target, on_error=note_unreadable):
+                if report_path is None or os.path.normcase(os.path.abspath(p)) != report_path:
+                    yield p
 
+    started = last = time.monotonic()
     try:
         for rep in scanner.scan_many(all_files(), jobs):
             counts[rep.verdict] += 1
             partial += rep.partly_scanned
+            if rep.skipped:
+                skipped_why[rep.skipped] += 1
+            if a.progress and time.monotonic() - last >= PROGRESS_EVERY:
+                last = time.monotonic()
+                print(f"progress: {sum(counts.values()):,} files in {_minutes(last - started)} "
+                      f"({counts['malicious']} malicious, {counts['suspicious']} suspicious, "
+                      f"{counts['error']} unreadable); now at {rep.path}", file=sys.stderr, flush=True)
             if a.json:
                 reports.append(rep)
                 continue
@@ -200,7 +241,7 @@ def main(argv=None) -> int:
                     continue  # clean archive members stay quiet
                 if a.quiet and node.verdict in ("clean", "skipped") and not node.unscanned:
                     continue
-                print(render_text(node, a.verbose, color))
+                print(render_text(node, a.verbose, color), file=out)
     except WorkerCrashed as e:
         print(f"error: {e}", file=sys.stderr)
         return 3
@@ -208,25 +249,58 @@ def main(argv=None) -> int:
         print("\ninterrupted", file=sys.stderr)
         return 130
 
-    if online:
-        online.save_cache()
-        for w in online.warnings:
+    if scanner.online:
+        scanner.online.save_cache()
+        for w in scanner.online.warnings:
             print(f"warning: {w}", file=sys.stderr)
 
     if a.json:
-        json.dump({"summary": dict(counts, partly_scanned=partial), "files": [to_dict(r) for r in reports]}, sys.stdout, indent=2)
-        print()
+        summary = dict(counts, partly_scanned=partial, skipped_reasons=dict(skipped_why),
+                       unreadable_folders=len(unreadable))
+        json.dump({"summary": summary, "files": [to_dict(r) for r in reports],
+                   "unreadable_folders": unreadable}, out, indent=2)
+        print(file=out)
     else:
+        if unreadable:
+            print(f"\nFolders that could not be opened ({len(unreadable)}), so the files in them were not scanned:",
+                  file=out)
+            for line in unreadable[:20]:
+                print(f"    {line}", file=out)
+            if len(unreadable) > 20:
+                print(f"    ... and {len(unreadable) - 20} more", file=out)
         total = sum(counts.values())
-        print(f"\nScanned {total} file(s): " + ", ".join(f"{v} {k}" for k, v in counts.items())
-              + (f"; {partial} not fully scanned" if partial else ""))
+        line = (f"Scanned {total} file(s) in {_minutes(time.monotonic() - started)}: "
+                + ", ".join(f"{v} {k}" for k, v in counts.items())
+                + (f"; {partial} not fully scanned" if partial else "")
+                + ("; skipped: " + ", ".join(f"{n} {why}" for why, n in skipped_why.most_common())
+                   if skipped_why else "")
+                + (f"; {len(unreadable)} folder(s) could not be opened" if unreadable else ""))
+        print("\n" + line, file=out)
+        if out is not sys.stdout:
+            print(line + f"\nreport written to {a.output}", file=sys.stderr)
 
     # Exit codes: 0 clean, 1 suspicious, 2 malicious found, 3 errors only
     if counts["malicious"]:
         return 2
     if counts["suspicious"]:
         return 1
-    return 3 if counts["error"] else 0
+    return 3 if counts["error"] or unreadable else 0
+
+
+def _minutes(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def _never_fail_on_odd_names() -> None:
+    """A file name the console cannot show (say, Thai on an English Windows code page, or
+    undecodable bytes on Linux) must not end a long scan: print such characters as escapes."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 if __name__ == "__main__":

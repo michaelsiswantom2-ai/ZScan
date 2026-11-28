@@ -22,6 +22,32 @@ VT_TYPES = BINARY_TYPES | {"script", "ole", "pdf"} | ARCHIVE_TYPES | set(UNSUPPO
 ARCHIVE_SEP = "!"   # shown as outer.zip!inner/file.exe
 CONTAINER_TYPES = {"zip", "gzip", "bzip2", "xz", "tar"}   # members get their own scan once unpacked
 
+# Windows marks files whose contents live elsewhere, such as OneDrive "online-only" files.
+# Reading one makes Windows download it, so a whole-drive scan could pull an entire cloud
+# drive onto the disk. These are reported as skipped instead (they are not on this machine).
+_FILE_ATTRIBUTE_OFFLINE = 0x1000
+_FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+_NOT_LOCAL = _FILE_ATTRIBUTE_OFFLINE | _FILE_ATTRIBUTE_RECALL_ON_OPEN | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+CLOUD_ONLY = "cloud-only (not downloaded)"
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003     # directory junctions and mounted volumes
+
+
+def not_local(st: os.stat_result) -> bool:
+    """True for a file whose bytes are not on this machine (Windows cloud placeholders)."""
+    return bool(getattr(st, "st_file_attributes", 0) & _NOT_LOCAL)
+
+
+def is_junction(path: str) -> bool:
+    """Windows directory junction (or a volume mounted on a folder). Always False elsewhere."""
+    check = getattr(os.path, "isjunction", None)     # Python 3.12+
+    if check is not None:
+        return check(path)
+    try:
+        return getattr(os.lstat(path), "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
+
 
 class Scanner:
     """Two phases, so the slow part can run in worker processes:
@@ -48,7 +74,11 @@ class Scanner:
     def analyze_file(self, path: Path) -> FileReport:
         rep = FileReport(path=str(path))
         try:
-            rep.size = path.stat().st_size
+            st = path.stat()        # reads attributes only; never downloads a cloud file
+            rep.size = st.st_size
+            if not_local(st):
+                rep.skipped = CLOUD_ONLY
+                return rep
             if rep.size > self.max_bytes:
                 rep.skipped = f"larger than {self.max_bytes // (1024 * 1024)} MiB"
                 return rep
@@ -192,11 +222,18 @@ class Scanner:
 
     # ------------------------------------------------------------ trees
 
-    def iter_paths(self, target: Path, follow_symlinks: bool = False) -> Iterator[Path]:
+    def iter_paths(self, target: Path, follow_symlinks: bool = False, on_error=None) -> Iterator[Path]:
+        """Files under `target`, in a stable order. `on_error(OSError)` hears about every
+        folder that could not be opened (for example no permission), so the caller can
+        report it rather than let that part of the tree go missing silently."""
         if target.is_file():
             yield target
             return
-        for root, dirs, files in os.walk(target, followlinks=follow_symlinks):
+        for root, dirs, files in os.walk(target, followlinks=follow_symlinks, onerror=on_error):
+            if not follow_symlinks:
+                # os.walk leaves symlinked folders alone but enters Windows junctions, which
+                # can repeat whole trees or loop (C:\Users\Default User, Application Data).
+                dirs[:] = [d for d in dirs if not is_junction(os.path.join(root, d))]
             dirs.sort()
             for name in sorted(files):
                 p = Path(root) / name
